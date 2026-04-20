@@ -1,0 +1,72 @@
+name: Build SPK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout iCloudPhotoSync
+        uses: actions/checkout@v4
+        with:
+          path: iCloudPhotoSync
+
+      - name: Clone Synology pkgscripts-ng
+        run: |
+          git clone https://github.com/SynologyOpenSource/pkgscripts-ng.git \
+            /opt/toolkit/pkgscripts-ng
+
+      - name: Place package source
+        run: |
+          mkdir -p /opt/toolkit
+          cp -r iCloudPhotoSync /opt/toolkit/iCloudPhotoSync
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-pip wget curl \
+            libxml2-utils cpio gzip
+
+      - name: Build SPK
+        run: |
+          cd /opt/toolkit/pkgscripts-ng
+          sudo python3 PkgCreate.py \
+            -v 7.2 \
+            -p noarch \
+            --no-sign \
+            -c iCloudPhotoSync
+        env:
+          LANG: en_US.UTF-8
+
+      - name: Find SPK
+        id: find_spk
+        run: |
+          SPK=$(find /opt/toolkit/build_env -name "*.spk" | head -1)
+          echo "spk_path=$SPK" >> $GITHUB_OUTPUT
+          SPK_NAME=$(basename "$SPK")
+          echo "spk_name=$SPK_NAME" >> $GITHUB_OUTPUT
+          echo "Found: $SPK"
+
+      - name: Upload SPK as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iCloudPhotoSync-spk
+          path: ${{ steps.find_spk.outputs.spk_path }}
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "iCloudPhotoSync Build ${{ github.run_number }}"
+          body: |
+            Automatischer Build aus Commit ${{ github.sha }}
+          files: ${{ steps.find_spk.outputs.spk_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
