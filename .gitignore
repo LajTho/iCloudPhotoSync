@@ -21,3 +21,8 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.pyo
+
+# Xcode (BordBar)
+xcuserdata/
+DerivedData/
+*.xcuserstate
