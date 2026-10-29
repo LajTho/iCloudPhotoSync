@@ -1,6 +1,7 @@
 import AVFoundation
 
 /// Läutet die Service-Klingel und ruft danach das gewünschte Getränk aus.
+@MainActor
 final class DrinkCaller: NSObject, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
     private var bell: AVAudioPlayer?
@@ -30,11 +31,11 @@ final class DrinkCaller: NSObject, AVSpeechSynthesizerDelegate {
     func stop() {
         bell?.stop()
         synthesizer.stopSpeaking(at: .immediate)
-        deactivateAudioSession()
+        Self.deactivateAudioSession()
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        deactivateAudioSession()
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Self.deactivateAudioSession()
     }
 
     private func activateAudioSession() {
@@ -44,7 +45,7 @@ final class DrinkCaller: NSObject, AVSpeechSynthesizerDelegate {
         try? session.setActive(true)
     }
 
-    private func deactivateAudioSession() {
+    private nonisolated static func deactivateAudioSession() {
         // Gibt gedimmte Musik anderer Apps wieder frei.
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
