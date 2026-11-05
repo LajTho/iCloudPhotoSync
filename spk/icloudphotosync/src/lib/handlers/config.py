@@ -32,12 +32,26 @@ def _sync_running(account_id):
 def handle(params):
     action = params.getvalue("action", "")
 
+    # Every action except validate_path works on an account's files. Reject
+    # unknown ids before any path is built from them, like the other
+    # handlers do (see #80).
+    if action != "validate_path":
+        account_id = params.getvalue("account_id", "").strip()
+        if account_id and not config_manager.get_account(account_id):
+            return {"success": False, "error": {"code": 204, "message": "Account not found"}}
+
     if action == "get":
         return _get_config(params)
     if action == "set":
         return _set_config(params)
     if action == "set_album":
         return _set_album(params)
+    if action == "validate_path":
+        return _validate_path(params)
+    if action == "reset_defaults":
+        return _reset_defaults(params)
+    if action == "reset_database":
+        return _reset_database(params)
 
     return {"success": False, "error": {"code": 101, "message": "Unknown action"}}
 
@@ -48,7 +62,48 @@ def _get_config(params):
         return {"success": False, "error": {"code": 301, "message": "account_id required"}}
 
     config = config_manager.get_sync_config(account_id)
+
+    # Include cached shared library availability so the UI can disable the toggle
+    cache_path = os.path.join(config_manager.get_account_dir(account_id), "album_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache = json.load(f)
+        config["has_shared_library"] = cache.get("has_shared_library", False)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        config["has_shared_library"] = False
+
     return {"success": True, "data": config}
+
+
+def _validate_path(params):
+    """Check if target path is writable and return filesystem diagnostics."""
+    path = params.getvalue("path", "").strip()
+    if not path:
+        return {"success": False, "error": {"code": 301, "message": "path required"}}
+
+    dsm_user = params.getvalue("dsm_user", "").strip()
+    resolved = _resolve_share_path(path)
+    resolved = _resolve_home_path(resolved, dsm_user)
+
+    from sync_engine import _writable, _get_mount_info
+
+    writable = _writable(resolved)
+    if not writable:
+        _grant_share_access(resolved)
+        writable = _writable(resolved)
+    mp, fstype, opts = _get_mount_info(resolved)
+
+    result = {
+        "writable": writable,
+        "mountpoint": mp,
+        "fstype": fstype,
+    }
+
+    if not writable and fstype:
+        no_acl = fstype.lower() in ("vfat", "exfat", "ntfs", "fuseblk", "msdos")
+        result["no_acl_fs"] = no_acl
+
+    return {"success": True, "data": result}
 
 
 def _get_dsm_username():
@@ -57,41 +112,49 @@ def _get_dsm_username():
     synoscgi doesn't set REMOTE_USER, so we extract the session ID
     from the HTTP_COOKIE and query the Synology Auth API internally.
     """
-    # Try direct env vars first
-    user = os.environ.get("REMOTE_USER", "") or os.environ.get("HTTP_X_SYNO_USER", "")
+    # Set by api.cgi after authenticate.cgi verified the session
+    user = os.environ.get("ICS_DSM_USER", "") or \
+        os.environ.get("REMOTE_USER", "") or os.environ.get("HTTP_X_SYNO_USER", "")
     if user:
         return user
 
-    # Extract session ID from cookie
     cookie_str = os.environ.get("HTTP_COOKIE", "")
     sid = ""
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if part.startswith("id="):
-            sid = part[3:]
+    for cookie_name in ("id", "smid", "did"):
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if part.startswith(cookie_name + "="):
+                sid = part[len(cookie_name) + 1:]
+                break
+        if sid:
             break
 
     if not sid:
         return ""
 
-    # Query Synology Auth API to get username from session
-    try:
-        import urllib.request
-        url = "http://localhost:5000/webapi/entry.cgi?api=SYNO.Core.CurrentConnection&version=1&method=list&_sid=%s" % sid
-        resp = urllib.request.urlopen(url, timeout=5)
-        result = json.loads(resp.read().decode("utf-8"))
-        if result.get("success") and result.get("data"):
-            items = result["data"].get("items", [])
-            # Find the connection matching the request IP
-            remote_ip = os.environ.get("REMOTE_ADDR", "")
-            for item in items:
-                if item.get("from") == remote_ip:
-                    return item.get("who", "")
-            # Fallback: return first connection's user
-            if items:
-                return items[0].get("who", "")
-    except Exception:
-        pass
+    import urllib.request
+    remote_ip = os.environ.get("REMOTE_ADDR", "")
+    apis = [
+        "http://localhost:5000/webapi/entry.cgi?api=SYNO.Core.CurrentConnection&version=1&method=list&_sid=%s",
+        "http://localhost:5001/webapi/entry.cgi?api=SYNO.Core.CurrentConnection&version=1&method=list&_sid=%s",
+    ]
+    for url_tpl in apis:
+        try:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(url_tpl % sid, timeout=5, context=ctx)
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("success") and result.get("data"):
+                items = result["data"].get("items", [])
+                for item in items:
+                    if item.get("from") == remote_ip:
+                        return item.get("who", "")
+                if items:
+                    return items[0].get("who", "")
+        except Exception:
+            continue
 
     return ""
 
@@ -108,17 +171,19 @@ def _resolve_share_path(path):
     """
     if not path or path.startswith("/volume"):
         return path
-    if path.startswith("/home"):
+    if path == "/home" or (path.startswith("/home/") and not path.startswith("/homes/")):
         return path
 
     parts = path.strip("/").split("/", 1)
     share_name = parts[0]
+    if not share_name or "/" in share_name or ".." in share_name:
+        return path
     sub_path = parts[1] if len(parts) > 1 else ""
 
     try:
         import subprocess
         result = subprocess.run(
-            ["/usr/syno/sbin/synoshare", "--get", share_name],
+            ["sudo", "/usr/syno/sbin/synoshare", "--get", share_name],
             capture_output=True, text=True, timeout=5
         )
         for line in result.stdout.splitlines():
@@ -143,7 +208,7 @@ def _resolve_home_path(path, dsm_user=""):
 
     Note: FileChooser "home" share maps to "homes" directory (plural).
     """
-    if not path or (not path.startswith("/home/") and path != "/home"):
+    if not path or path.startswith("/homes/") or (not path.startswith("/home/") and path != "/home"):
         return path
     if not dsm_user:
         dsm_user = _get_dsm_username()
@@ -151,6 +216,31 @@ def _resolve_home_path(path, dsm_user=""):
     if dsm_user:
         return os.path.join(config_manager.DEFAULT_VOLUME, "homes", dsm_user, sub)
     return path
+
+
+def _grant_share_access(target_dir):
+    """Grant the package user RW access to the shared folder containing target_dir.
+
+    Extracts the top-level share name from the path and calls synoshare.
+    Best-effort — failures are logged but don't block config saves.
+    """
+    if not target_dir or not target_dir.startswith("/volume"):
+        return
+    import re
+    m = re.match(r"^/volume\d+/([^/]+)", target_dir)
+    if not m:
+        return
+    share_name = m.group(1)
+    try:
+        import subprocess
+        import logging
+        subprocess.run(
+            ["sudo", "/usr/syno/sbin/synoshare", "--setuser", share_name, "RW", "+", "iCloudPhotoSync"],
+            capture_output=True, text=True, timeout=10
+        )
+        logging.getLogger(__name__).info("Granted RW access to share '%s'", share_name)
+    except Exception:
+        pass
 
 
 def _set_config(params):
@@ -181,6 +271,8 @@ def _set_config(params):
         acc = config_manager.get_account(account_id) or {}
         dsm_user = acc.get("dsm_user", "")
 
+    current = config_manager.get_sync_config(account_id)
+
     # Resolve FileChooser share-relative paths and /home/... paths at save time
     if "target_dir" in updates:
         updates["target_dir"] = _resolve_share_path(updates["target_dir"])
@@ -188,9 +280,17 @@ def _set_config(params):
         if resolved.startswith("/home/") or resolved == "/home":
             return {"success": False, "error": {"code": 304,
                 "message": "Cannot resolve home path — DSM username unknown. Pick a shared folder or reopen the app."}}
+        # Only validate when the target actually changes. The UI sends the
+        # full config on every save, so re-validating an unchanged (possibly
+        # stale) path would block all other settings changes (see #67).
+        if resolved != current.get("target_dir") and resolved.startswith("/volume"):
+            from sync_engine import _volume_exists
+            vol_mount = "/" + resolved.split("/")[1]
+            if not _volume_exists(vol_mount):
+                return {"success": False, "error": {"code": 305,
+                    "message": "Volume %s does not exist on this NAS. "
+                    "Please select a folder on an existing volume." % vol_mount}}
         updates["target_dir"] = resolved
-
-    current = config_manager.get_sync_config(account_id)
 
     # Target dir change policy is decided by the UI and passed via
     # `target_action`: "clear" (re-download everything, original behavior),
@@ -223,6 +323,10 @@ def _set_config(params):
         else:
             current[k] = v
     config_manager.save_sync_config(account_id, current)
+
+    if "target_dir" in updates:
+        _grant_share_access(updates["target_dir"])
+
     return {"success": True, "data": current}
 
 
@@ -241,9 +345,46 @@ def _set_album(params):
 
     enabled = params.getvalue("enabled", "true").strip().lower() in ("true", "1", "yes")
     album_type = params.getvalue("album_type", "user").strip()
+    library = params.getvalue("library", "").strip() or None
 
-    if album_type == "shared":
-        config = config_manager.set_shared_album_sync(account_id, album_name, enabled)
-    else:
-        config = config_manager.set_album_sync(account_id, album_name, enabled)
+    config = config_manager.set_album_sync(account_id, album_name, enabled, library=library)
     return {"success": True, "data": {"album": album_name, "enabled": enabled}}
+
+
+def _reset_defaults(params):
+    account_id = params.getvalue("account_id", "").strip()
+    if not account_id:
+        return {"success": False, "error": {"code": 301, "message": "account_id required"}}
+
+    if _sync_running(account_id):
+        return {"success": False, "error": {"code": 305,
+            "message": "Cannot reset while a sync is running."}}
+
+    current = config_manager.get_sync_config(account_id)
+    defaults = config_manager.get_sync_config("__nonexistent__")
+    defaults["target_dir"] = current.get("target_dir", defaults["target_dir"])
+    defaults["albums"]["selected"] = current.get("albums", {}).get("selected", {})
+    sl_selected = current.get("shared_library", {}).get("selected")
+    if sl_selected:
+        defaults.setdefault("shared_library", {})["selected"] = sl_selected
+    # Keep the album key migration marker with the selections it describes
+    for section in ("albums", "shared_library"):
+        version = current.get(section, {}).get("key_version")
+        if version:
+            defaults.setdefault(section, {})["key_version"] = version
+    config_manager.save_sync_config(account_id, defaults)
+    return {"success": True, "data": defaults}
+
+
+def _reset_database(params):
+    account_id = params.getvalue("account_id", "").strip()
+    if not account_id:
+        return {"success": False, "error": {"code": 301, "message": "account_id required"}}
+
+    if _sync_running(account_id):
+        return {"success": False, "error": {"code": 305,
+            "message": "Cannot reset while a sync is running."}}
+
+    import sync_manifest
+    sync_manifest.clear_all(account_id)
+    return {"success": True}

@@ -33,6 +33,19 @@ from config_manager import get_account_dir
 logger = logging.getLogger(__name__)
 
 
+def _is_transient_error(exc):
+    """True if exc means Apple could not be reached, not that auth failed."""
+    import requests.exceptions
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout)):
+        return True
+    try:
+        from pyicloud_ipd.exceptions import PyiCloudServiceUnavailableException
+        return isinstance(exc, PyiCloudServiceUnavailableException)
+    except ImportError:
+        return False
+
+
 class ICloudClient:
     """Wraps PyiCloudService with session persistence per account."""
 
@@ -43,6 +56,7 @@ class ICloudClient:
         self.session_dir = get_account_dir(account_id)
         self.api = None
         self._error = None
+        self.transient_error = False
 
     def login(self):
         """Attempt login. Returns dict with status info."""
@@ -93,7 +107,21 @@ class ICloudClient:
                     msg = m.group(1)
             return {"success": False, "error": msg}
         except Exception as e:
-            logger.exception("Login error")
+            logger.exception("Login error for %s", self.apple_id)
+            import requests.exceptions
+            if isinstance(e, requests.exceptions.ConnectionError):
+                return {"success": False, "error":
+                    "Connection to Apple servers failed. Check DNS settings "
+                    "and network connectivity on this NAS."}
+            if isinstance(e, requests.exceptions.Timeout):
+                return {"success": False, "error":
+                    "Connection to Apple servers timed out. The server may "
+                    "be temporarily unavailable — please try again later."}
+            if isinstance(e, requests.exceptions.SSLError):
+                return {"success": False, "error":
+                    "SSL certificate verification failed. Check that the "
+                    "system date/time is correct and CA certificates are "
+                    "up to date."}
             return {"success": False, "error": "Connection error: %s" % str(e)}
 
     def _restore_session_for_2fa(self):
@@ -140,7 +168,17 @@ class ICloudClient:
 
             phones = self.api.get_trusted_phone_numbers()
             if not phones:
-                return {"success": False, "error": "No trusted phone numbers found"}
+                # Apple returns no phone numbers when the account is secured
+                # exclusively with hardware security keys or passkeys — the
+                # web API then offers no SMS/code fallback at all (see #58).
+                return {"success": False, "error":
+                    "Apple did not return any trusted phone numbers for this "
+                    "account. If your Apple ID uses only passkeys or hardware "
+                    "security keys (FIDO2/YubiKey) for two-factor "
+                    "authentication, Apple does not offer code-based sign-in "
+                    "for third-party apps — this app cannot log in then. "
+                    "Otherwise, add a trusted phone number at "
+                    "account.apple.com under Sign-In and Security."}
 
             result = self.api.send_2fa_code_sms(phones[0].id)
             if result:
@@ -192,7 +230,14 @@ class ICloudClient:
             return {"success": False, "error": str(e)}
 
     def restore_session(self):
-        """Try to restore a previously authenticated session."""
+        """Try to restore a previously authenticated session.
+
+        On failure, self.transient_error tells the caller whether Apple was
+        merely unreachable (network outage, DNS, 503 — the stored session
+        may still be fine) or the session was actually rejected. Only the
+        latter should flip the account to re_auth_needed (see #76).
+        """
+        self.transient_error = False
         if not PYICLOUD_AVAILABLE:
             return False
 
@@ -202,13 +247,26 @@ class ICloudClient:
                 apple_id=self.apple_id,
                 cookie_directory=self.session_dir,
             )
-            return not (self.api.requires_2fa or self.api.requires_2sa)
-        except Exception:
+            if not self.api.data.get("dsInfo"):
+                logger.warning("Session restore returned no account data for %s "
+                               "(session dir: %s) — session file may be missing or corrupt",
+                               self.apple_id, self.session_dir)
+                return False
+            if self.api.requires_2fa or self.api.requires_2sa:
+                logger.info("Session for %s requires re-authentication (2FA/2SA)",
+                            self.apple_id)
+                return False
+            return True
+        except Exception as e:
+            self.transient_error = _is_transient_error(e)
+            logger.warning("Session restore failed for %s%s", self.apple_id,
+                           " (Apple unreachable, will retry)" if self.transient_error else "",
+                           exc_info=True)
             return False
 
     def is_authenticated(self):
         """Check if the current session is valid."""
-        if not self.api:
+        if not self.api or not self.api.data.get("dsInfo"):
             return False
         try:
             return not (self.api.requires_2fa or self.api.requires_2sa)

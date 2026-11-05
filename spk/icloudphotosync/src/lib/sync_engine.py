@@ -6,6 +6,7 @@ for folder structure. Always fetches the live photo list from Apple
 (never relies on cached album counts).
 """
 import contextlib
+import errno
 import fcntl
 import logging
 import os
@@ -24,9 +25,260 @@ import heic_converter
 LOGGER = logging.getLogger("sync_engine")
 
 
+def migrate_album_keys(account_id, legacy_keys, selected=None, library=None):
+    """Move name-keyed album selections and manifest rows to path keys (#81).
+
+    `selected` (an in-memory copy of the selection) is updated as well.
+    """
+    try:
+        moved = config_manager.migrate_album_keys(
+            account_id, legacy_keys, library=library)
+    except Exception:
+        LOGGER.exception("Album key migration failed")
+        return {}
+    for old, new in moved.items():
+        if selected is not None and old in selected:
+            selected.setdefault(new, selected.pop(old))
+        try:
+            rows = sync_manifest.rename_album(account_id, old, new)
+        except Exception:
+            LOGGER.exception("Manifest migration failed for album %r", old)
+            rows = 0
+        LOGGER.info("Migrated album %r -> %r (%d manifest rows)", old, new, rows)
+    return moved
+
+
+def _remove_album_from_cache(account_id, album_name):
+    """Remove a stale album from the album_cache.json."""
+    try:
+        cache_path = os.path.join(config_manager.get_account_dir(account_id), "album_cache.json")
+        with open(cache_path, "r") as f:
+            cache = json.load(f)
+        changed = False
+        for key in ("counts", "types", "parents", "names"):
+            if album_name in cache.get(key, {}):
+                cache[key].pop(album_name)
+                changed = True
+        if changed:
+            cache["updated"] = int(time.time())
+            with open(cache_path, "w") as f:
+                json.dump(cache, f)
+            LOGGER.info("Removed stale album %r from cache", album_name)
+    except Exception:
+        pass
+
+
+SHARED_DIR = "Shared"
+
+_OLD_DIR_NAMES = {
+    "Meine Mediathek": "",
+    "Geteilte Mediathek": SHARED_DIR,
+    "Personal Library": "",
+    "Shared Library": SHARED_DIR,
+}
+
+
+def _migrate_manifest_paths(account_id, target_dir):
+    """One-time migration: rewrite old library-subfolder paths to flat layout."""
+    marker = os.path.join(config_manager.get_account_dir(account_id), ".paths_migrated")
+    if os.path.exists(marker):
+        return
+    try:
+        conn = sync_manifest._connect(account_id)
+        try:
+            rows = conn.execute(
+                "SELECT rowid, local_path FROM synced_photos"
+            ).fetchall()
+            updates = []
+            for row in rows:
+                path = row["local_path"]
+                if not path.startswith(target_dir):
+                    continue
+                rel = path[len(target_dir):].lstrip(os.sep)
+                parts = rel.split(os.sep)
+                if len(parts) >= 2 and parts[0] in _OLD_DIR_NAMES:
+                    replacement = _OLD_DIR_NAMES[parts[0]]
+                    if replacement:
+                        new_rel = os.path.join(replacement, *parts[1:])
+                    else:
+                        new_rel = os.path.join(*parts[1:])
+                    new_path = os.path.join(target_dir, new_rel)
+                    if new_path != path:
+                        updates.append((new_path, row["rowid"]))
+            if updates:
+                conn.executemany(
+                    "UPDATE synced_photos SET local_path=? WHERE rowid=?",
+                    updates
+                )
+                conn.commit()
+                LOGGER.info("Manifest migration: updated %d paths", len(updates))
+        finally:
+            conn.close()
+    except Exception:
+        LOGGER.exception("Manifest migration failed")
+    try:
+        with open(marker, "w") as f:
+            f.write("migrated\n")
+    except Exception:
+        pass
+
+
+def _sanitize_path_component(name):
+    """Remove path traversal and dangerous characters from a single path component."""
+    if not name:
+        return "unknown"
+    name = name.replace("/", "_").replace("\\", "_")
+    name = name.replace("\x00", "").replace("\r", "").replace("\n", "")
+    while ".." in name:
+        name = name.replace("..", "")
+    name = name.strip(". ")
+    return name or "unknown"
+
+
+def _safe_join(base, *parts):
+    """Join paths and verify the result stays inside base."""
+    result = os.path.join(base, *parts)
+    result = os.path.realpath(result)
+    base = os.path.realpath(base)
+    if not result.startswith(base + os.sep) and result != base:
+        raise ValueError("Path traversal detected: %s escapes %s" % (result, base))
+    return result
+
+
+def _makedirs_safe(path, mode=0o755):
+    """Create directories without following symlinks in intermediate components.
+
+    Raises _DiskFullError on ENOSPC/EDQUOT so callers can abort early.
+    """
+    parts = []
+    head = path
+    while True:
+        head, tail = os.path.split(head)
+        if not tail:
+            break
+        parts.append(tail)
+        if os.path.isdir(head):
+            break
+    parts.reverse()
+    current = head
+    for part in parts:
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            os.remove(current)
+        if not os.path.isdir(current):
+            try:
+                os.mkdir(current, mode)
+            except OSError as e:
+                if _is_disk_full_error(e):
+                    raise _DiskFullError(str(e)) from e
+                raise
+
+
 class _UrlExpiredError(Exception):
     """Raised when an iCloud CDN URL returns 410 Gone (expired)."""
     pass
+
+
+_URL_EXPIRY_BUFFER = 300  # refresh URLs expiring within 5 minutes
+
+
+def _url_expiry_time(url):
+    """Extract the expiry unix timestamp from an iCloud CDN URL's 'e=' param.
+
+    Returns the timestamp as int, or 0 if not parseable.
+    """
+    if not url:
+        return 0
+    try:
+        start = url.find("&e=")
+        if start < 0:
+            start = url.find("?e=")
+        if start < 0:
+            return 0
+        start += 3
+        end = url.find("&", start)
+        return int(url[start:end] if end > start else url[start:])
+    except (ValueError, IndexError):
+        return 0
+
+
+# Network retry settings
+_NET_RETRY_MAX = 5           # max pause/retry cycles per album batch run
+_NET_RETRY_INTERVAL = 30     # seconds between connectivity checks
+_NET_CONSECUTIVE_FAIL = 30   # consecutive download failures before pausing
+
+
+def _check_connectivity():
+    """Return True if we can reach Apple's CDN (lightweight HEAD request)."""
+    try:
+        r = requests.head("https://www.apple.com", timeout=10)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
+class _DiskFullError(Exception):
+    """Raised when ENOSPC is detected during download."""
+    pass
+
+
+_DISK_FULL_ERRNOS = frozenset([
+    errno.ENOSPC,    # 28 — No space left on device
+    errno.EDQUOT,    # 122 — Disk quota exceeded
+])
+
+
+def _is_disk_full_error(exc):
+    """Return True if the exception indicates disk/quota exhaustion."""
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in _DISK_FULL_ERRNOS:
+        return True
+    return False
+
+
+def _is_permanent_api_error(exc):
+    """Return True if the exception is a permanent API error (don't retry)."""
+    from pyicloud_ipd.exceptions import PyiCloudAPIResponseException
+    if isinstance(exc, PyiCloudAPIResponseException):
+        return getattr(exc, "code", "") in ("BAD_REQUEST",)
+    return False
+
+
+def _is_connection_error(exc):
+    """Return True if the exception indicates a real connectivity problem."""
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    if isinstance(exc, requests.exceptions.Timeout):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "errno", None) in _DISK_FULL_ERRNOS:
+            return False
+        if isinstance(exc, (ConnectionRefusedError, ConnectionResetError,
+                            ConnectionAbortedError, BrokenPipeError)):
+            return True
+    return False
+
+
+def _wait_for_connectivity(account_id, max_cycles=_NET_RETRY_MAX):
+    """Block until network is available or max_cycles exhausted.
+
+    Checks connectivity immediately first — if the network is fine,
+    returns True without any delay.
+    Returns True if connectivity is available, False if we gave up.
+    """
+    if _check_connectivity():
+        LOGGER.info("Network check: connectivity OK, resuming immediately")
+        return True
+    for cycle in range(max_cycles):
+        LOGGER.info("Network check %d/%d — waiting %ds...",
+                    cycle + 1, max_cycles, _NET_RETRY_INTERVAL)
+        time.sleep(_NET_RETRY_INTERVAL)
+        if should_stop(account_id):
+            return False
+        if _check_connectivity():
+            LOGGER.info("Network restored after %d checks", cycle + 1)
+            return True
+    LOGGER.warning("Network still down after %d checks, giving up", max_cycles)
+    return False
 
 # Map folder structure config values to strftime-like path builders
 FOLDER_BUILDERS = {
@@ -47,36 +299,94 @@ def _ts_path(timestamp_ms, fmt):
 def _build_filename(photo, config):
     """Build the filename for a photo based on config."""
     if config.get("filenames") == "date_based" and photo.created:
-        ext = os.path.splitext(photo.filename)[1] or ".jpg"
+        raw_ext = os.path.splitext(photo.filename)[1]
+        ext = ("." + _sanitize_path_component(raw_ext)) if raw_ext else ".jpg"
         return time.strftime("%Y-%m-%d_%H%M%S", time.localtime(photo.created / 1000.0)) + ext
-    return photo.filename
+    return _sanitize_path_component(photo.filename)
 
 
-def _resolve_conflict(path, config, synced_this_run=None):
+def _name_taken(path, dir_cache=None):
+    """True if path exists, or a name differing only in case does.
+
+    btrfs is case-sensitive, but SMB/AFP clients and Synology Drive are not:
+    writing IMG_1.heic next to IMG_1.HEIC makes Drive rename ours to
+    *_Conflict, the next sync finds it missing and downloads it again —
+    every run, forever (see #85).
+
+    dir_cache maps directory -> set of lowercased entry names, so large
+    flat folders are listed once per sync instead of once per photo.
+    """
+    if os.path.lexists(path):
+        return True
+    d, name = os.path.split(path)
+    if dir_cache is None:
+        dir_cache = {}
+    names = dir_cache.get(d)
+    if names is None:
+        try:
+            names = {n.lower() for n in os.listdir(d)}
+        except OSError:
+            names = set()
+        dir_cache[d] = names
+    return name.lower() in names
+
+
+def _remember_name(path, dir_cache):
+    """Record a path we are about to create in the _name_taken cache."""
+    if dir_cache is None:
+        return
+    d, name = os.path.split(path)
+    if d in dir_cache:
+        dir_cache[d].add(name.lower())
+
+
+def _output_paths(path, extra_exts=()):
+    """path plus the sibling files a download will produce (e.g. the .jpg
+    written by HEIC conversion)."""
+    base = os.path.splitext(path)[0]
+    return [path] + [base + e for e in extra_exts]
+
+
+def _resolve_conflict(path, config, synced_this_run=None, dir_cache=None,
+                      extra_exts=()):
     """Handle file conflicts. Returns final path or None to skip.
 
     synced_this_run: set of paths downloaded in this sync run.
     If a conflict is with a file we just created (same name, different photo),
     always rename regardless of config to avoid data loss.
+
+    extra_exts: extensions of files the download will also create next to
+    path — HEIC→JPG conversion writes <base>.jpg, which must be free too.
+
+    Names are compared case-insensitively (see _name_taken).
     """
-    if not os.path.exists(path):
+    def taken(p):
+        return any(_name_taken(o, dir_cache) for o in _output_paths(p, extra_exts))
+
+    if not taken(path):
         return path
 
     conflict = config.get("conflict", "skip")
 
     # If the existing file was created in this same sync run,
     # always rename to avoid losing a different photo with the same name
-    if synced_this_run and path in synced_this_run:
+    if synced_this_run and any(o in synced_this_run
+                               for o in _output_paths(path, extra_exts)):
         conflict = "rename"
 
     if conflict == "overwrite":
-        return path
+        # Only overwrite exact matches — a case variant is a different
+        # file on disk and writing next to it would create the clash.
+        if not any(_name_taken(o, dir_cache) and not os.path.lexists(o)
+                   for o in _output_paths(path, extra_exts)):
+            return path
+        conflict = "rename"
     if conflict == "skip":
         return None
     if conflict == "rename":
         base, ext = os.path.splitext(path)
         i = 1
-        while os.path.exists("%s_%d%s" % (base, i, ext)):
+        while taken("%s_%d%s" % (base, i, ext)):
             i += 1
         return "%s_%d%s" % (base, i, ext)
     return None
@@ -88,9 +398,11 @@ def _download_file(url, dest_path, session=None):
     Writes to dest_path + ".part" first, then atomically renames on success.
     A partial download therefore can never be mistaken for a complete file
     by the next sync's existence check.
+
+    Raises _DiskFullError immediately on ENOSPC/EDQUOT (no retry).
     """
     dest_dir = os.path.dirname(dest_path)
-    os.makedirs(dest_dir, exist_ok=True)
+    _makedirs_safe(dest_dir)
     # Ensure directories are world-readable so DSM File Station can see them
     try:
         os.chmod(dest_dir, 0o755)
@@ -127,6 +439,12 @@ def _download_file(url, dest_path, session=None):
                 pass
             raise
         except Exception as e:
+            if _is_disk_full_error(e):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise _DiskFullError(str(e)) from e
             last_err = e
             try:
                 os.remove(tmp_path)
@@ -156,6 +474,25 @@ def _writable(path):
         return False
 
 
+def _get_mount_info(path):
+    """Return (mountpoint, fstype, mount_options) for the given path, or Nones."""
+    try:
+        real = os.path.realpath(path)
+        best_mp, best_fs, best_opts = "/", "unknown", ""
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                mp, fs, opts = parts[1], parts[2], parts[3]
+                if real == mp or real.startswith(mp.rstrip("/") + "/"):
+                    if len(mp) > len(best_mp):
+                        best_mp, best_fs, best_opts = mp, fs, opts
+        return best_mp, best_fs, best_opts
+    except Exception:
+        return None, None, None
+
+
 def _log_path_diagnostics(path):
     """Log detailed permission info so support requests are actionable."""
     import grp
@@ -176,6 +513,11 @@ def _log_path_diagnostics(path):
         LOGGER.error("  Running as: uid=%s(%s) groups=%s", uid, uname, ",".join(gnames))
     except Exception:
         pass
+
+    # Log filesystem type and mount options
+    mp, fs, opts = _get_mount_info(path)
+    if mp:
+        LOGGER.error("  Filesystem: mountpoint=%s type=%s opts=%s", mp, fs, opts)
 
     # Walk up the path tree to find where permissions diverge.
     parts = path.rstrip("/")
@@ -201,6 +543,29 @@ def _log_path_diagnostics(path):
         parts = os.path.dirname(parts)
 
 
+def _volume_exists(vol_mount):
+    """Return True if /volumeN is a real data volume.
+
+    The point of this check is to prevent writing to the root filesystem
+    (system partition overflow) when the volume doesn't exist. ismount()
+    alone is too strict: it returns False for symlinked volumes (e.g.
+    /volume1 -> /volume2 after a pool migration) and can fail on exotic
+    setups even though the volume is perfectly valid (see issue #67).
+    A device comparison against / covers those cases — anything that
+    lives on a different device than the system partition is safe.
+    """
+    if not os.path.isdir(vol_mount):
+        return False
+    if os.path.ismount(vol_mount):
+        return True
+    try:
+        return os.stat(vol_mount).st_dev != os.stat("/").st_dev
+    except OSError:
+        # Cannot verify — let the later writability check decide instead
+        # of locking the user out on a stat error.
+        return True
+
+
 def _resolve_target_dir(path, account_id=None):
     """Resolve a DSM FileChooser path to the actual filesystem path.
 
@@ -212,6 +577,12 @@ def _resolve_target_dir(path, account_id=None):
     if not path:
         return path
     if path.startswith("/volume"):
+        # Verify the volume actually exists to prevent writing to the
+        # root filesystem (system partition).
+        parts = path.split("/")
+        volume_mount = "/" + parts[1]  # e.g. "/volume1"
+        if not _volume_exists(volume_mount):
+            return "__INVALID_VOLUME__:" + path
         return path
 
     # /home/... is a per-user virtual share -- maps to <volume>/homes/<user>/...
@@ -227,7 +598,23 @@ def _resolve_target_dir(path, account_id=None):
             return os.path.join(config_manager.DEFAULT_VOLUME, "homes", dsm_user, sub)
         return "__UNRESOLVED_HOME__:" + path
 
-    # Other shared folders: prepend default volume
+    # Other shared folders: look up which volume the share lives on
+    parts = path.strip("/").split("/", 1)
+    share_name = parts[0]
+    sub_path = parts[1] if len(parts) > 1 else ""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["/usr/syno/sbin/synoshare", "--get", share_name],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("Path"):
+                real_share = line.split("[", 1)[-1].rstrip("]").strip()
+                if real_share:
+                    return os.path.join(real_share, sub_path) if sub_path else real_share
+    except Exception:
+        pass
     return config_manager.DEFAULT_VOLUME + path
 
 
@@ -245,10 +632,11 @@ class SyncProgress:
         self.started_at = 0
         self.finished_at = 0
         self.error = ""
+        self.warnings = []
         self._last_save_ts = 0.0
 
     def to_dict(self):
-        return {
+        d = {
             "status": self.status,
             "current_album": self.current_album,
             "total_photos": self.total_photos,
@@ -259,6 +647,9 @@ class SyncProgress:
             "finished_at": self.finished_at,
             "error": self.error,
         }
+        if self.warnings:
+            d["warnings"] = self.warnings
+        return d
 
     def save(self):
         """Persist progress to a JSON file for status queries.
@@ -304,8 +695,14 @@ def runner_alive(account_id):
     a sync_runner.py subprocess or a scheduler thread in our own process).
     This replaces a prior /proc cmdline scan which only matched
     sync_runner.py and mis-flagged scheduler-run syncs as crashed.
-    Fails open (returns True) so transient lock errors don't clobber
-    progress state.
+
+    Fails closed (returns False) when the lock file cannot be opened so
+    that a permission error or missing file never permanently blocks the
+    user from changing settings.  The caller (heal_stale_progress) will
+    then reset the stale progress, which is the safer default: a
+    false-negative here at most allows a concurrent config write during
+    the rare window of an active sync, whereas a false-positive locks
+    the user out entirely (see #32).
     """
     lock_path = os.path.join(config_manager.get_account_dir(account_id), ".sync.lock")
     if not os.path.exists(os.path.dirname(lock_path)):
@@ -323,7 +720,8 @@ def runner_alive(account_id):
             pass
         return False
     except OSError:
-        return True
+        LOGGER.warning("Cannot probe sync lock for %s — assuming no runner", account_id)
+        return False
     finally:
         if fd is not None:
             try:
@@ -332,13 +730,35 @@ def runner_alive(account_id):
                 pass
 
 
+_STALE_PROGRESS_SECONDS = 600  # 10 minutes without a heartbeat → stale
+
+
 def heal_stale_progress(progress):
     """If progress claims syncing/starting but no runner exists, flip to
     'stopped' and persist. Returns True if a heal was applied. Use this
     everywhere progress.status is read for gating decisions, not just in
     the status poll -- otherwise a crashed runner blocks all writes until
-    the UI polls."""
-    if progress.status in ("syncing", "starting") and not runner_alive(progress.account_id):
+    the UI polls.
+
+    Two independent checks:
+    1. flock probe (runner_alive) — fast and reliable when the filesystem
+       cooperates.
+    2. Staleness timeout — if started_at is >10 min ago and the progress
+       file hasn't been updated (the sync loop calls save_throttled every
+       ~1s), the runner is dead regardless of what flock says.  This
+       catches edge cases where the lock probe fails (NFS, permissions).
+    """
+    if progress.status not in ("syncing", "starting"):
+        return False
+
+    stale_by_time = (
+        progress.started_at
+        and (int(time.time()) - progress.started_at) > _STALE_PROGRESS_SECONDS
+        and not progress.finished_at
+        and _progress_file_stale(progress.account_id)
+    )
+
+    if not runner_alive(progress.account_id) or stale_by_time:
         progress.status = "stopped"
         if not progress.finished_at:
             progress.finished_at = int(time.time())
@@ -346,6 +766,16 @@ def heal_stale_progress(progress):
         progress.save()
         return True
     return False
+
+
+def _progress_file_stale(account_id):
+    """True if sync_progress.json hasn't been modified in >_STALE_PROGRESS_SECONDS."""
+    path = os.path.join(config_manager.get_account_dir(account_id), "sync_progress.json")
+    try:
+        mtime = os.path.getmtime(path)
+        return (time.time() - mtime) > _STALE_PROGRESS_SECONDS
+    except OSError:
+        return True
 
 
 # Global flag to signal stop
@@ -465,15 +895,28 @@ def _run_sync_locked(account_id):
         return progress
 
     sync_config = config_manager.get_sync_config(account_id)
-    raw_target = sync_config.get("target_dir", config_manager.DEFAULT_VOLUME + "/iCloudPhotos")
+    raw_target = sync_config.get("target_dir", config_manager.DEFAULT_TARGET_DIR)
     target_dir = _resolve_target_dir(raw_target, account_id)
+
+    if isinstance(target_dir, str) and target_dir.startswith("__INVALID_VOLUME__:"):
+        volume_path = target_dir.split(":", 1)[1]
+        progress.status = "error"
+        progress.error = (
+            "The volume in %r does not exist on this NAS. "
+            "Please go to Settings and select a valid target folder "
+            "(e.g. %s). Syncing to a non-existent volume "
+            "would write to the system partition and fill it up."
+        ) % (volume_path, config_manager.DEFAULT_TARGET_DIR)
+        LOGGER.error("Target volume does not exist: %s", volume_path)
+        progress.save()
+        return progress
 
     if isinstance(target_dir, str) and target_dir.startswith("__UNRESOLVED_HOME__:"):
         progress.status = "error"
         progress.error = (
             "Konnte den DSM-Benutzer für das Home-Verzeichnis %r nicht "
             "ermitteln. Bitte einen expliziten Volume-Pfad wählen "
-            "(z.B. %s/iCloudPhotos)." % (raw_target, config_manager.DEFAULT_VOLUME)
+            "(z.B. %s)." % (raw_target, config_manager.DEFAULT_TARGET_DIR)
         )
         progress.save()
         return progress
@@ -484,27 +927,38 @@ def _run_sync_locked(account_id):
         progress.status = "error"
         progress.error = (
             "Target directory %r is not writable by the package user "
-            "'iCloudPhotoSync'. To fix this:\n"
+            "'iCloudPhotoSync'. Re-select the folder in Settings — "
+            "permissions are granted automatically.\n\n"
+            "If the problem persists:\n"
             "1. Open Control Panel → Shared Folder\n"
             "2. Select the target share → Edit → Permissions tab\n"
-            "3. IMPORTANT: Change the dropdown from 'Local Users' to "
+            "3. Change the dropdown from 'Local Users' to "
             "'System internal user'\n"
             "4. Check 'Read/Write' for the 'iCloudPhotoSync' user\n"
-            "5. Click Save\n\n"
-            "The package user is a system internal user and will NOT "
-            "appear in the 'Local Users' list. You must switch the "
-            "dropdown first."
+            "5. Click Save"
         ) % target_dir
         progress.save()
         return progress
+
+    # One-time migration: rewrite old German folder names in manifest
+    _migrate_manifest_paths(account_id, target_dir)
 
     # Authenticate
     client = icloud_client.get_client(account_id, account["apple_id"])
     if not client.restore_session():
         progress.status = "error"
-        progress.error = "Not authenticated -- re-login required"
+        if client.transient_error:
+            # Network/Apple outage (e.g. nightly ISP reconnect). The session
+            # is likely still valid — keep the account active so the next
+            # scheduled run retries instead of pausing sync (see #76).
+            LOGGER.warning("Apple unreachable for %s — sync skipped, will retry "
+                           "at the next scheduled run", account_id)
+            progress.error = ("Could not reach Apple's iCloud servers. "
+                              "The sync will be retried automatically.")
+        else:
+            progress.error = "Not authenticated -- re-login required"
+            config_manager.update_account(account_id, {"status": "re_auth_needed"})
         progress.save()
-        config_manager.update_account(account_id, {"status": "re_auth_needed"})
         return progress
 
     progress.status = "syncing"
@@ -513,12 +967,31 @@ def _run_sync_locked(account_id):
 
     try:
         photos_svc = client.api.photos
+        # Probe CloudKit once up front. Later calls (album counts, zone
+        # detection) swallow errors, so a rejected web session would
+        # otherwise end as a "complete" sync with nothing synced (#87).
+        photos_svc._private_zones()
     except Exception as e:
-        from vendor.pyicloud_ipd.exceptions import (
+        from pyicloud_ipd.exceptions import (
             PyiCloudADPProtectionException,
             PyiCloudServiceNotActivatedException,
+            PyiCloudSessionExpiredException,
         )
-        if isinstance(e, (PyiCloudADPProtectionException, PyiCloudServiceNotActivatedException)):
+        if isinstance(e, PyiCloudSessionExpiredException):
+            LOGGER.error("CloudKit rejected the session for %s: %s", account_id, e)
+            progress.status = "error"
+            progress.error = str(e)
+            progress.save()
+            config_manager.update_account(account_id, {"status": "re_auth_needed"})
+            return progress
+        if icloud_client._is_transient_error(e):
+            LOGGER.warning("Apple unreachable for %s: %s", account_id, e)
+            progress.status = "error"
+            progress.error = ("Could not reach Apple's iCloud servers. "
+                              "The sync will be retried automatically.")
+            progress.save()
+            return progress
+        if isinstance(e, PyiCloudADPProtectionException):
             LOGGER.error(
                 "iCloud Advanced Data Protection (ADP) appears to be enabled "
                 "for account %s. ADP encrypts iCloud Photos end-to-end, "
@@ -528,18 +1001,36 @@ def _run_sync_locked(account_id):
             progress.error = str(e)
             progress.save()
             return progress
-        raise
+        if isinstance(e, PyiCloudServiceNotActivatedException):
+            LOGGER.error(
+                "iCloud Photos is not available for account %s. "
+                "Make sure iCloud Photos is enabled in the Apple ID "
+                "settings for this account.", account_id)
+            progress.status = "error"
+            progress.error = str(e)
+            progress.save()
+            return progress
+        LOGGER.exception("Could not access iCloud Photos for account %s", account_id)
+        progress.status = "error"
+        progress.error = str(e)
+        progress.finished_at = int(time.time())
+        progress.save()
+        return progress
 
     try:
+        # Invalidate album cache so we fetch fresh data from iCloud,
+        # preventing "Album not found" errors for recently changed albums.
+        photos_svc.refresh_albums()
+
         # Build a plan with photo counts upfront so total_photos is a
         # stable denominator for the progress bar (no mid-run growth).
         plan = []  # (album_name, folder_key, subfolder, photo_count, latest_date)
         if sync_config.get("photostream", {}).get("enabled", True):
             try:
-                ps_album = photos_svc.albums.get("All Photos")
+                ps_album = photos_svc.full_library
                 ps_count = ps_album.photo_count if ps_album else 0
             except Exception as e:
-                from vendor.pyicloud_ipd.exceptions import PyiCloudADPProtectionException
+                from pyicloud_ipd.exceptions import PyiCloudADPProtectionException
                 if isinstance(e, PyiCloudADPProtectionException):
                     LOGGER.error(
                         "ADP blocks access to iCloud Photos for account %s: %s",
@@ -554,6 +1045,8 @@ def _run_sync_locked(account_id):
 
         if sync_config.get("albums", {}).get("enabled", True):
             selected = sync_config.get("albums", {}).get("selected", {})
+            # Must run before _album_meta, which deselects unknown names.
+            migrate_album_keys(account_id, photos_svc.legacy_album_keys, selected)
             enabled_albums = [
                 name for name, en in selected.items()
                 if en and name != "All Photos"
@@ -563,55 +1056,138 @@ def _run_sync_locked(account_id):
                 try:
                     alb = photos_svc.albums.get(name)
                     if not alb:
+                        LOGGER.warning(
+                            "Album %r not found in iCloud — it may have been "
+                            "renamed, deleted, or contains special characters "
+                            "that changed during encoding. "
+                            "Auto-removing from sync list.", name)
+                        _remove_album_from_cache(account_id, name)
+                        config_manager.set_album_sync(account_id, name, False)
+                        return (0, 0)
+                    if alb.album_type == "folder":
                         return (0, 0)
                     # CloudKit rejects resultsLimit<=2, photos() doubles
                     # internally (asset+master pairing), so limit=2.
                     first = alb.photos(limit=2, offset=0, direction="DESCENDING")
                     latest = first[0].created if first else 0
                     return (alb.photo_count or 0, latest)
-                except Exception:
-                    LOGGER.exception("Failed to get meta for album %s", name)
+                except Exception as e:
+                    if _is_permanent_api_error(e):
+                        LOGGER.warning("Album %s: %s (skipping)", name, e)
+                    else:
+                        LOGGER.exception("Failed to get meta for album %s", name)
                     return (0, 0)
 
             album_metas = [(name,) + _album_meta(name) for name in enabled_albums]
             album_metas.sort(key=lambda t: t[2], reverse=True)
             for name, count, latest in album_metas:
-                plan.append((name, "albums", name, count, latest))
+                alb = photos_svc.albums.get(name)
+                if alb is None:
+                    continue  # already reported and deselected by _album_meta
+                # Folders are containers without their own record type —
+                # querying their photos sends "recordType": null which Apple
+                # rejects with BAD_REQUEST (see #63). Their sub-albums are
+                # synced as separate entries, so skipping loses nothing.
+                if alb is not None and alb.album_type == "folder":
+                    continue
+                if alb and alb.parent_folder:
+                    parts = [_sanitize_path_component(p) for p in alb.parent_folder.split("/")]
+                    parts.append(_sanitize_path_component(alb.name))
+                    sub = os.path.join(*parts)
+                else:
+                    sub = _sanitize_path_component(alb.name)
+                plan.append((name, "albums", sub, count, latest))
 
-        if sync_config.get("shared_albums", {}).get("enabled", False):
-            selected_shared = sync_config.get("shared_albums", {}).get("selected", {})
-            enabled_shared = [name for name, en in selected_shared.items() if en]
-            if enabled_shared:
+        if photos_svc.has_shared_library:
+            sl_selected = sync_config.get("shared_library", {}).get("selected", {})
+            if any(n != "All Photos" for n in sl_selected):
                 try:
-                    shared = photos_svc.shared_albums
-                    for name in enabled_shared:
-                        alb = shared.get(name)
-                        if alb:
+                    migrate_album_keys(
+                        account_id,
+                        photos_svc.legacy_shared_library_album_keys,
+                        sl_selected, library="shared")
+                except Exception:
+                    LOGGER.exception("Failed to load shared library albums")
+            # The Albums tab's Shared Library "All Photos" checkbox was
+            # ignored — the whole shared library always synced (#71).
+            # Unset means "never touched": keep syncing like before.
+            if sl_selected.get("All Photos", True):
+                try:
+                    sl_album = photos_svc.shared_library
+                    if sl_album:
+                        sl_count = sl_album.photo_count or 0
+                        plan.append(("All Photos", "shared_library", "", sl_count, 0))
+                except Exception:
+                    LOGGER.exception("Failed to plan shared library")
+
+            # Shared Library user albums
+            sl_enabled = [name for name, en in sl_selected.items() if en and name != "All Photos"]
+            if sl_enabled:
+                try:
+                    sl_albums = photos_svc.shared_library_albums
+                    for name in sl_enabled:
+                        alb = sl_albums.get(name)
+                        if alb and alb.album_type != "folder":
                             try:
                                 count = alb.photo_count or 0
                             except Exception:
                                 count = 0
-                            plan.append((name, "shared_albums", name, count, 0))
+                            if alb.parent_folder:
+                                parts = [_sanitize_path_component(p) for p in alb.parent_folder.split("/")]
+                                parts.append(_sanitize_path_component(alb.name))
+                                sub = os.path.join(*parts)
+                            else:
+                                sub = _sanitize_path_component(alb.name)
+                            plan.append((name, "shared_library_albums", sub, count, 0))
                 except Exception:
-                    LOGGER.exception("Failed to plan shared albums")
+                    LOGGER.exception("Failed to plan shared library albums")
 
         progress.total_photos = sum(p[3] for p in plan)
+
+        # Pre-seed skipped count from manifest so the progress bar starts
+        # at the right percentage after a restart (instead of jumping to 0%).
+        # Photos already in the manifest will not increment skipped_photos
+        # again during dedup — see _dedup_preseeded flag in _sync_album.
+        try:
+            manifest_count = sync_manifest.count_unique_records(account_id)
+            progress.skipped_photos = min(manifest_count, progress.total_photos)
+        except Exception:
+            LOGGER.debug("Could not pre-seed progress from manifest")
+
         progress.save()
 
+        heic_convert_failures = []
         for album_name, folder_key, subfolder, _count, _latest in plan:
             if should_stop(account_id):
                 break
-            _sync_album(
+            failures = _sync_album(
                 account_id, photos_svc, album_name,
                 target_dir, sync_config, progress,
                 folder_key=folder_key,
-                subfolder=subfolder
+                subfolder=subfolder,
+                client=client
             )
+            if failures:
+                heic_convert_failures.extend(failures)
 
         if should_stop(account_id):
             progress.status = "stopped"
+        elif progress.error:
+            # e.g. "Disk full — sync aborted": reporting "complete" hid the
+            # abort behind a green status
+            progress.status = "error"
         else:
             progress.status = "complete"
+            if heic_convert_failures:
+                LOGGER.warning(
+                    "%d HEIC file(s) could not be converted to JPG. "
+                    "Check that heif-convert or ImageMagick is properly "
+                    "installed. Failed files: %s",
+                    len(heic_convert_failures),
+                    ", ".join(heic_convert_failures[:20]))
+                progress.warnings = progress.warnings or []
+                progress.warnings.append(
+                    "%d HEIC->JPG conversion(s) failed" % len(heic_convert_failures))
         progress.finished_at = int(time.time())
         progress.save()
 
@@ -621,27 +1197,38 @@ def _run_sync_locked(account_id):
         progress.error = str(e)
         progress.finished_at = int(time.time())
         progress.save()
+        from pyicloud_ipd.exceptions import PyiCloudSessionExpiredException
+        if isinstance(e, PyiCloudSessionExpiredException):
+            config_manager.update_account(account_id, {"status": "re_auth_needed"})
 
     clear_stop(account_id)
     return progress
 
 
-def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, progress, folder_key, subfolder):
+def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, progress, folder_key, subfolder, client=None):
     """Sync a single album."""
+    heic_convert_failures = []
     progress.current_album = album_name
     progress.save()
 
-    if folder_key == "shared_albums":
-        album = photos_svc.shared_albums.get(album_name)
+    if folder_key == "photostream":
+        album = photos_svc.full_library
+    elif folder_key == "shared_library":
+        album = photos_svc.shared_library
+    elif folder_key == "shared_library_albums":
+        album = photos_svc.shared_library_albums.get(album_name)
     else:
         album = photos_svc.albums.get(album_name)
     if not album:
         LOGGER.warning("Album not found: %s", album_name)
-        return
+        return heic_convert_failures
 
-    # Get folder structure config for this type
-    folder_config = sync_config.get(folder_key, {})
-    folder_structure = folder_config.get("folder_structure", "year_month" if folder_key == "photostream" else "flat")
+    # Get folder structure config for this type (shared library uses photostream settings)
+    if folder_key in ("shared_library", "shared_library_albums"):
+        folder_config = sync_config.get("photostream", {})
+    else:
+        folder_config = sync_config.get(folder_key, {})
+    folder_structure = folder_config.get("folder_structure", "year_month" if folder_key in ("photostream", "shared_library", "shared_library_albums") else "flat")
     folder_builder = FOLDER_BUILDERS.get(folder_structure, FOLDER_BUILDERS["flat"])
 
     # total_photos is set upfront in run_sync from the plan — don't
@@ -652,6 +1239,11 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
     # the download pool below mutates this set from multiple worker threads.
     synced_this_run = set()
     synced_lock = threading.Lock()
+    # Lowercased directory listings for case-insensitive conflict checks
+    dir_cache = {}
+    # Also save the video part of Live Photos as <name>.MOV
+    from pyicloud_ipd.services.photos import LiveVideoAsset
+    live_enabled = bool(sync_config.get("live_photos", False))
 
     # Track record_ids processed in this run. CloudKit's paginated album
     # queries can return the same record in multiple batches (overlapping
@@ -680,10 +1272,11 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
         "exists_time": 0.0,  # cumulative time spent in those exists calls
     }
     progress_lock = threading.Lock()
+    disk_full_abort = [False]
 
     def _process_batch(photos, offset_for_log):
         """Run dedup, conflict, hardlink, and download for one batch."""
-        if not photos:
+        if not photos or disk_full_abort[0]:
             return
         perf["pairs"] += len(photos)
         perf["batches"] += 1
@@ -692,6 +1285,52 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
 
         _t_local = time.time()
         tasks = []
+
+        def _queue_live(photo, image_path):
+            """Queue the .MOV of a Live Photo next to its still image.
+
+            Called wherever the still ends up on disk (already synced,
+            hardlinked or about to download), so libraries synced before
+            the option was enabled get their videos on the next run.
+            """
+            if not (live_enabled and getattr(photo, "is_live", False) and image_path):
+                return
+            vid = LiveVideoAsset(photo._master, photo._asset)
+            if vid.manifest_id in seen_record_ids:
+                return
+            seen_record_ids.add(vid.manifest_id)
+            vpath = os.path.splitext(image_path)[0] + os.path.splitext(vid.filename)[1]
+            known = synced_checksums.get(vid.manifest_id)
+            ours = bool(known) and known[1] == vpath
+            if ours and os.path.exists(vpath) and known[0] == vid.checksum:
+                return  # already synced
+            with synced_lock:
+                # Never clobber a file we don't own (a reservation made by
+                # the still's conflict resolution counts as ours).
+                if (not ours and vpath not in synced_this_run
+                        and _name_taken(vpath, dir_cache)):
+                    LOGGER.info("Live Photo video skipped, name taken: %s", vpath)
+                    return
+                synced_this_run.add(vpath)
+                _remember_name(vpath, dir_cache)
+            if sync_config.get("albums", {}).get("deduplicate_hardlinks", True):
+                existing = sync_manifest.find_any_synced_path(account_id, vid.manifest_id)
+                if existing and existing != vpath and not os.path.lexists(vpath):
+                    try:
+                        os.link(existing, vpath)
+                        if sync_manifest.mark_synced(
+                                account_id, vid.manifest_id, album_name,
+                                os.path.basename(vpath), vpath,
+                                checksum=vid.checksum, size=vid.size,
+                                created=vid.created):
+                            return
+                        os.remove(vpath)
+                    except OSError as e:
+                        LOGGER.info("Hardlink failed (%s); falling back to download", e)
+            if not vid.original_url:
+                return
+            tasks.append((vid, vid.original_url, vpath, os.path.basename(vpath)))
+
         for photo in photos:
             if should_stop(account_id):
                 break
@@ -711,23 +1350,50 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
                     perf["exists_calls"] += 1
                     if _exists:
                         LOGGER.debug("Skipped (dedup): %s in %s", photo.filename, album_name)
-                        progress.skipped_photos += 1
+                        # Don't increment skipped_photos — these are already
+                        # counted in the manifest pre-seed at sync start.
                         progress.save_throttled()
+                        _queue_live(photo, existing_path)
                         continue
+                    elif _name_taken(existing_path, dir_cache):
+                        # A case variant took the slot (e.g. Synology Drive
+                        # renamed our copy to *_Conflict). Re-resolve the
+                        # name instead of recreating the clash (#85).
+                        LOGGER.info("File missing but name taken by a case "
+                                    "variant, re-resolving: %s", existing_path)
                     else:
                         LOGGER.info("Re-downloading (file missing): %s", existing_path)
                         redownload_path = existing_path
+                # The manifest pre-seed already counted this record as
+                # skipped, but it is processed again (file missing or photo
+                # changed) and will be counted as synced/failed — take it out
+                # so the progress can't read "149 of 99" and sit at 100%
+                # while downloads still run.
+                with progress_lock:
+                    progress.skipped_photos = max(0, progress.skipped_photos - 1)
+
+            # HEIC that will be converted also produces <base>.jpg
+            converts = (sync_config.get("formats", "original") in ("jpg_only", "both")
+                        and heic_converter.is_heic(photo.filename)
+                        and heic_converter.can_convert())
 
             if redownload_path:
                 dest_path = redownload_path
                 final_path = redownload_path
-                filename = os.path.basename(redownload_path)
+                if converts and not heic_converter.is_heic(redownload_path):
+                    # jpg_only records the converted .jpg in the manifest.
+                    # Download to the HEIC name so the converter recreates
+                    # the .jpg — writing the original straight to the .jpg
+                    # path stored HEIC bytes under a .jpg name.
+                    final_path = (os.path.splitext(redownload_path)[0]
+                                  + os.path.splitext(photo.filename)[1])
+                filename = os.path.basename(final_path)
             else:
                 date_subfolder = folder_builder(photo.created)
                 filename = _build_filename(photo, sync_config)
 
-                if folder_key == "shared_albums":
-                    dest_dir = os.path.join(target_dir, "Shared", subfolder, date_subfolder)
+                if folder_key == "shared_library":
+                    dest_dir = os.path.join(target_dir, SHARED_DIR, date_subfolder)
                 elif subfolder:
                     dest_dir = os.path.join(target_dir, "Albums", subfolder, date_subfolder)
                 else:
@@ -740,8 +1406,11 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
 
                 dest_path = os.path.join(dest_dir, filename)
 
+                extra_exts = ((".jpg",) if converts else ()) +                     ((".MOV",) if live_enabled and photo.is_live else ())
                 with synced_lock:
-                    final_path = _resolve_conflict(dest_path, sync_config, synced_this_run)
+                    final_path = _resolve_conflict(dest_path, sync_config,
+                                                   synced_this_run, dir_cache,
+                                                   extra_exts)
                     if final_path is None:
                         LOGGER.debug("Skipped (conflict): %s", dest_path)
                         progress.skipped_photos += 1
@@ -751,37 +1420,48 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
                     # pick the same name and race us to the file. Was dest_path
                     # before — that was wrong: rename-resolved final_path is
                     # what actually gets written.
-                    synced_this_run.add(final_path)
+                    for out in _output_paths(final_path, extra_exts):
+                        synced_this_run.add(out)
+                        _remember_name(out, dir_cache)
 
             if sync_config.get("albums", {}).get("deduplicate_hardlinks", True) and not redownload_path:
                 existing = sync_manifest.find_any_synced_path(account_id, photo.id)
-                if existing and existing != final_path:
+                link_path = final_path
+                if existing:
+                    # The existing copy may be the converted .jpg — link it
+                    # under its own extension, not as <name>.HEIC
+                    link_ext = os.path.splitext(existing)[1]
+                    if link_ext.lower() != os.path.splitext(final_path)[1].lower():
+                        link_path = os.path.splitext(final_path)[0] + link_ext
+                if existing and existing != link_path:
                     try:
-                        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+                        os.makedirs(os.path.dirname(link_path), exist_ok=True)
                         try:
-                            os.chmod(os.path.dirname(final_path), 0o755)
+                            os.chmod(os.path.dirname(link_path), 0o755)
                         except OSError:
                             pass
-                        os.link(existing, final_path)
+                        os.link(existing, link_path)
                         ok = sync_manifest.mark_synced(
-                            account_id, photo.id, album_name, filename, final_path,
+                            account_id, photo.id, album_name,
+                            os.path.basename(link_path), link_path,
                             checksum=photo.checksum, size=photo.size, created=photo.created
                         )
                         if not ok:
                             # Roll back the hardlink so the next sync sees a
                             # clean state (no orphan file without manifest row).
                             try:
-                                os.remove(final_path)
+                                os.remove(link_path)
                             except OSError:
                                 pass
                             progress.failed_photos += 1
                             progress.save_throttled()
                             continue
                         with synced_lock:
-                            synced_this_run.add(final_path)
+                            synced_this_run.add(link_path)
                         progress.synced_photos += 1
                         progress.save_throttled()
-                        LOGGER.debug("Hardlinked %s -> %s", existing, final_path)
+                        LOGGER.debug("Hardlinked %s -> %s", existing, link_path)
+                        _queue_live(photo, link_path)
                         continue
                     except OSError as e:
                         LOGGER.info("Hardlink failed (%s); falling back to download", e)
@@ -800,6 +1480,7 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
                 with synced_lock:
                     synced_this_run.add(final_path)
             tasks.append((photo, download_url, final_path, filename))
+            _queue_live(photo, final_path)
 
         perf["local"] += time.time() - _t_local
 
@@ -808,6 +1489,7 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
 
         workers = max(1, min(8, int(sync_config.get("parallel_downloads", 4) or 4)))
         formats = sync_config.get("formats", "original")
+        jpg_quality = max(10, min(100, int(sync_config.get("jpg_quality", 85) or 85)))
 
         # One-shot warning per sync if the user requested JPG output but no
         # converter is available. Without this, sync silently leaves HEIC
@@ -821,68 +1503,249 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
             )
 
         def _process(task):
+            """Returns (photo, fname, fpath, ok, is_conn_error, is_url_expired, is_disk_full)."""
             photo, url, fpath, fname = task
             if should_stop(account_id):
-                return (photo, fname, fpath, False)
+                return (photo, fname, fpath, False, False, False, False)
+            expiry = _url_expiry_time(url)
+            if expiry and expiry < int(time.time()):
+                return (photo, fname, fpath, False, False, True, False)
             try:
                 ok = _download_file(url, fpath, session=session)
             except _UrlExpiredError:
-                LOGGER.info("URL expired (410) for %s, refreshing...", fname)
-                fresh_url = photos_svc.refresh_photo_url(photo)
-                if fresh_url:
-                    try:
-                        ok = _download_file(fresh_url, fpath, session=session)
-                    except _UrlExpiredError:
-                        LOGGER.error("URL expired again after refresh for %s", fname)
-                        ok = False
-                else:
-                    LOGGER.error("Could not refresh URL for %s", fname)
-                    ok = False
+                return (photo, fname, fpath, False, False, True, False)
+            except _DiskFullError:
+                return (photo, fname, fpath, False, False, False, True)
+            except Exception as e:
+                if _is_connection_error(e):
+                    return (photo, fname, fpath, False, True, False, False)
+                return (photo, fname, fpath, False, False, False, False)
             if not ok:
-                return (photo, fname, fpath, False)
+                return (photo, fname, fpath, False, False, False, False)
             if formats in ("jpg_only", "both") and heic_converter.is_heic(fname):
                 if heic_converter.can_convert():
-                    jpg_path = heic_converter.convert_to_jpg(fpath)
-                    if jpg_path and formats == "jpg_only":
-                        try:
-                            os.remove(fpath)
-                        except OSError:
-                            pass
-                        fpath = jpg_path
-            return (photo, fname, fpath, True)
+                    jpg_path = heic_converter.convert_to_jpg(fpath, quality=jpg_quality)
+                    if jpg_path:
+                        if formats == "jpg_only":
+                            try:
+                                os.remove(fpath)
+                            except OSError:
+                                pass
+                            fpath = jpg_path
+                    else:
+                        LOGGER.warning("HEIC conversion failed for %s", fname)
+                        heic_convert_failures.append(fname)
+            return (photo, fname, fpath, True, False, False, False)
 
-        pool = ThreadPoolExecutor(max_workers=workers)
-        futures = []
-        try:
-            futures = [pool.submit(_process, t) for t in tasks]
-            for fut in as_completed(futures):
-                if should_stop(account_id):
-                    # Signal stop, cancel queued, but let in-flight workers
-                    # finish — _process honors should_stop on its next check.
-                    # Letting them complete avoids leaving .part files when
-                    # we tear down mid-stream.
-                    for f in futures:
-                        f.cancel()
-                    break
-                photo, fname, fpath, ok = fut.result()
-                with progress_lock:
-                    if ok:
-                        if sync_manifest.mark_synced(
-                            account_id, photo.id, album_name, fname, fpath,
-                            checksum=photo.checksum, size=photo.size, created=photo.created
-                        ):
-                            progress.synced_photos += 1
-                        else:
+        # Proactive URL refresh: if URLs are expired or expiring within the
+        # buffer window, refresh them BEFORE starting downloads to avoid a
+        # cascade of 410 errors when a large album's URLs all share one expiry.
+        now = int(time.time())
+        expiring_tasks = []
+        valid_tasks = []
+        for task in tasks:
+            photo, url, fpath, fname = task
+            expiry = _url_expiry_time(url)
+            if expiry and expiry < now + _URL_EXPIRY_BUFFER:
+                expiring_tasks.append(task)
+            else:
+                valid_tasks.append(task)
+
+        if expiring_tasks and not should_stop(account_id):
+            LOGGER.info("Proactive refresh: %d/%d URLs expired or expiring soon",
+                        len(expiring_tasks), len(tasks))
+            refresh_photos = [t[0] for t in expiring_tasks]
+            zone_id = (photos_svc._detect_shared_library_zone()
+                       if folder_key == "shared_library" else None)
+            fresh_urls = {}
+            try:
+                fresh_urls = photos_svc.batch_refresh_photo_urls(
+                    refresh_photos, zone_id=zone_id)
+            except Exception:
+                LOGGER.warning("Proactive batch refresh failed, attempting re-auth...")
+                try:
+                    if client and client.restore_session():
+                        photos_svc.session = client.api.session
+                        fresh_urls = photos_svc.batch_refresh_photo_urls(
+                            refresh_photos, zone_id=zone_id)
+                except Exception:
+                    LOGGER.exception("Proactive refresh failed after re-auth")
+
+            refreshed = 0
+            kept_old = 0
+            already_expired = 0
+            now_check = int(time.time())
+            for photo, old_url, fpath, fname in expiring_tasks:
+                new_url = photo.original_url if photo.id in fresh_urls else None
+                if new_url:
+                    valid_tasks.append((photo, new_url, fpath, fname))
+                    refreshed += 1
+                else:
+                    expiry = _url_expiry_time(old_url)
+                    if expiry and expiry < now_check:
+                        already_expired += 1
+                        with progress_lock:
                             progress.failed_photos += 1
                     else:
-                        progress.failed_photos += 1
-                    progress.save_throttled()
-        finally:
-            # wait=True so any in-flight worker can finalize its .part->dest
-            # rename before we return; without this, a stop request leaves
-            # .part files that the next sync would re-download anyway but
-            # also clutters the target tree.
-            pool.shutdown(wait=True)
+                        valid_tasks.append((photo, old_url, fpath, fname))
+                        kept_old += 1
+            if refreshed:
+                LOGGER.info("Proactively refreshed %d/%d expired URLs",
+                            refreshed, len(expiring_tasks))
+            if kept_old:
+                LOGGER.warning("Proactive refresh: %d photos kept old URL "
+                               "(will retry on 410 during download)", kept_old)
+            if already_expired:
+                LOGGER.warning("Proactive refresh: %d photos with already-expired "
+                               "URLs counted as failed (refresh returned no new URL)",
+                               already_expired)
+
+        pending_tasks = list(valid_tasks)
+        net_retries_used = 0
+        url_refresh_used = 0
+        _URL_REFRESH_MAX = 3
+
+        while pending_tasks and not should_stop(account_id) and not disk_full_abort[0]:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            conn_retry_tasks = []
+            expired_tasks = []
+            consecutive_fails = 0
+            network_failed = False
+            futures = []
+            try:
+                futures = [pool.submit(_process, t) for t in pending_tasks]
+                for fut in as_completed(futures):
+                    if should_stop(account_id) or disk_full_abort[0]:
+                        for f in futures:
+                            f.cancel()
+                        break
+                    photo, fname, fpath, ok, is_conn_err, is_url_expired, is_disk_full = fut.result()
+                    with progress_lock:
+                        if is_disk_full:
+                            disk_full_abort[0] = True
+                            progress.failed_photos += 1
+                            LOGGER.error(
+                                "Disk full (ENOSPC/EDQUOT) — aborting album '%s'. "
+                                "Check available space, inode usage, and folder/user quotas.",
+                                album_name)
+                            progress.error = "Disk full — sync aborted"
+                            for f in futures:
+                                f.cancel()
+                            break
+                        elif ok:
+                            consecutive_fails = 0
+                            if sync_manifest.mark_synced(
+                                account_id, photo.manifest_id, album_name, fname, fpath,
+                                checksum=photo.checksum, size=photo.size, created=photo.created
+                            ):
+                                # Live videos belong to a photo already counted
+                                if not isinstance(photo, LiveVideoAsset):
+                                    progress.synced_photos += 1
+                            else:
+                                progress.failed_photos += 1
+                        elif is_url_expired:
+                            expired_tasks.append((photo, fpath, fname))
+                        else:
+                            if is_conn_err:
+                                consecutive_fails += 1
+                            else:
+                                consecutive_fails = 0
+                            if consecutive_fails >= _NET_CONSECUTIVE_FAIL and not network_failed:
+                                LOGGER.warning(
+                                    "Album '%s': %d consecutive connection errors — likely network outage",
+                                    album_name, consecutive_fails)
+                                network_failed = True
+                            if network_failed and is_conn_err:
+                                conn_retry_tasks.append((photo, photo.original_url, fpath, fname))
+                            else:
+                                progress.failed_photos += 1
+                        progress.save_throttled()
+            finally:
+                pool.shutdown(wait=True)
+
+            if disk_full_abort[0]:
+                progress.save()
+                return
+
+            # Batch-refresh expired CDN URLs
+            refresh_retry_tasks = []
+            if expired_tasks and not should_stop(account_id):
+                url_refresh_used += 1
+                if url_refresh_used <= _URL_REFRESH_MAX:
+                    refresh_photos = [t[0] for t in expired_tasks]
+                    zone_id = (photos_svc._detect_shared_library_zone()
+                               if folder_key == "shared_library" else None)
+                    fresh_urls = {}
+                    try:
+                        fresh_urls = photos_svc.batch_refresh_photo_urls(
+                            refresh_photos, zone_id=zone_id)
+                    except Exception:
+                        LOGGER.warning("Batch URL refresh failed, attempting session re-auth...")
+                        try:
+                            if client and client.restore_session():
+                                photos_svc.session = client.api.session
+                                fresh_urls = photos_svc.batch_refresh_photo_urls(
+                                    refresh_photos, zone_id=zone_id)
+                            else:
+                                LOGGER.error("Session re-auth failed")
+                        except Exception:
+                            LOGGER.exception("Batch refresh failed after re-auth")
+                    refreshed = 0
+                    for photo, fpath, fname in expired_tasks:
+                        url = photo.original_url if photo.id in fresh_urls else None
+                        if url:
+                            refresh_retry_tasks.append((photo, url, fpath, fname))
+                            refreshed += 1
+                        else:
+                            with progress_lock:
+                                progress.failed_photos += 1
+                    if refreshed:
+                        LOGGER.info("Batch-refreshed %d/%d expired URLs",
+                                    refreshed, len(expired_tasks))
+                else:
+                    LOGGER.warning("Max URL refresh retries (%d) exhausted, "
+                                   "counting %d as failed",
+                                   _URL_REFRESH_MAX, len(expired_tasks))
+                    with progress_lock:
+                        progress.failed_photos += len(expired_tasks)
+                        progress.save()
+
+            retry_tasks = refresh_retry_tasks + conn_retry_tasks
+
+            if not retry_tasks or should_stop(account_id):
+                break
+
+            # Handle connection retries with network wait
+            if conn_retry_tasks:
+                net_retries_used += 1
+                if net_retries_used > _NET_RETRY_MAX:
+                    LOGGER.warning("Album '%s': max network retries exhausted, counting %d as failed",
+                                   album_name, len(conn_retry_tasks))
+                    with progress_lock:
+                        progress.failed_photos += len(conn_retry_tasks)
+                        progress.save()
+                    retry_tasks = refresh_retry_tasks
+                    if not retry_tasks:
+                        break
+                else:
+                    LOGGER.info("Album '%s': pausing for network recovery (%d files to retry, attempt %d/%d)",
+                                album_name, len(conn_retry_tasks), net_retries_used, _NET_RETRY_MAX)
+                    progress.error = "Waiting for network... (attempt %d/%d)" % (net_retries_used, _NET_RETRY_MAX)
+                    progress.save()
+
+                    if not _wait_for_connectivity(account_id):
+                        LOGGER.warning("Album '%s': network not restored, counting %d as failed",
+                                       album_name, len(conn_retry_tasks))
+                        with progress_lock:
+                            progress.failed_photos += len(conn_retry_tasks)
+                            progress.save()
+                        retry_tasks = refresh_retry_tasks
+                        if not retry_tasks:
+                            break
+
+            progress.error = ""
+            progress.save()
+            pending_tasks = retry_tasks
 
         progress.save()
 
@@ -890,7 +1753,12 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
     MULTI_TRACK_THRESHOLD = 1000
     NUM_TRACKS = 4
 
-    if folder_key == "photostream" and total > MULTI_TRACK_THRESHOLD:
+    # Photostream ("All Photos") always uses ASCENDING from 0 because
+    # some iCloud accounts return an unreliable CloudKit count (e.g. 49
+    # instead of thousands).  ASCENDING + page-until-empty is count-
+    # independent and guaranteed to enumerate the full library.
+    # Multi-track is only used for album types with reliable counts.
+    if folder_key not in ("photostream",) and total > MULTI_TRACK_THRESHOLD:
         # Multi-track: N producers fetch disjoint DESCENDING ranges in
         # parallel to hide Apple's ~13s/batch latency. Local processing
         # stays single-threaded on the main consumer (it's only ~3s total
@@ -903,10 +1771,22 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
                 off = slice_end - 1
                 while off >= slice_start and not should_stop(account_id):
                     limit = min(batch_size, off - slice_start + 1)
-                    try:
-                        photos = album.photos(limit=limit, offset=off, direction="DESCENDING")
-                    except Exception:
-                        LOGGER.exception("Producer fetch failed at offset=%d", off)
+                    photos = None
+                    for _retry in range(_NET_RETRY_MAX):
+                        try:
+                            photos = album.photos(limit=limit, offset=off, direction="DESCENDING")
+                            break
+                        except Exception as e:
+                            if _is_permanent_api_error(e):
+                                LOGGER.warning("Producer fetch failed at offset=%d: %s (permanent, not retrying)", off, e)
+                                break
+                            LOGGER.exception("Producer fetch failed at offset=%d (attempt %d)", off, _retry + 1)
+                            if _is_connection_error(e):
+                                if not _wait_for_connectivity(account_id, max_cycles=3):
+                                    break
+                            else:
+                                time.sleep(2 + _retry * 3)
+                    if photos is None or should_stop(account_id):
                         break
                     if not photos:
                         break
@@ -927,7 +1807,7 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
 
         LOGGER.info("Multi-track fetch: %d producers over %d photos", len(threads), total)
         remaining = len(threads)
-        while remaining > 0 and not should_stop(account_id):
+        while remaining > 0 and not should_stop(account_id) and not disk_full_abort[0]:
             _t_wait = time.time()
             item = q.get()
             perf["fetch_wait"] += time.time() - _t_wait
@@ -937,19 +1817,31 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
             off, photos = item
             _process_batch(photos, off)
     else:
-        # Single-track with one-batch-ahead prefetch. Still useful for
-        # user-created albums (ASCENDING) and for small photostreams.
-        if folder_key == "photostream":
-            direction = "DESCENDING"
-            offset = max(total - 1, 0)
-        else:
-            direction = "ASCENDING"
-            offset = 0
+        # Single-track with one-batch-ahead prefetch.  Photostream always
+        # lands here (ASCENDING from 0, pages until empty — count-independent).
+        direction = "ASCENDING"
+        offset = 0
+
+        def _fetch_with_retry(lim, off, dirn):
+            for _retry in range(_NET_RETRY_MAX):
+                try:
+                    return album.photos(limit=lim, offset=off, direction=dirn)
+                except Exception as e:
+                    if _is_permanent_api_error(e):
+                        LOGGER.warning("Fetch failed at offset=%d: %s (permanent, not retrying)", off, e)
+                        return None
+                    LOGGER.exception("Fetch failed at offset=%d (attempt %d)", off, _retry + 1)
+                    if _is_connection_error(e):
+                        if not _wait_for_connectivity(account_id, max_cycles=3):
+                            return None
+                    else:
+                        time.sleep(2 + _retry * 3)
+            return None
 
         fetch_pool = ThreadPoolExecutor(max_workers=1)
-        next_future = fetch_pool.submit(album.photos, limit=batch_size, offset=offset, direction=direction)
+        next_future = fetch_pool.submit(_fetch_with_retry, batch_size, offset, direction)
 
-        while not should_stop(account_id):
+        while not should_stop(account_id) and not disk_full_abort[0]:
             _t_wait = time.time()
             photos = next_future.result()
             perf["fetch_wait"] += time.time() - _t_wait
@@ -961,11 +1853,11 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
             if direction == "DESCENDING" and next_offset < 0:
                 next_future = fetch_pool.submit(lambda: [])
             else:
-                next_future = fetch_pool.submit(album.photos, limit=batch_size, offset=next_offset, direction=direction)
+                next_future = fetch_pool.submit(_fetch_with_retry, batch_size, next_offset, direction)
 
             _process_batch(photos, offset)
 
-            if should_stop(account_id):
+            if should_stop(account_id) or disk_full_abort[0]:
                 break
             offset = next_offset
 
@@ -976,3 +1868,5 @@ def _sync_album(account_id, photos_svc, album_name, target_dir, sync_config, pro
         album_name, perf["batches"], perf["pairs"],
         perf["fetch_wait"], perf["local"], perf["exists_calls"], perf["exists_time"]
     )
+
+    return heic_convert_failures

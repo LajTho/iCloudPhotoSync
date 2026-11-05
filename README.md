@@ -1,53 +1,64 @@
-# Synology iCloud Photo Sync — spksrc package
-
+# Synology iCloud Photo Sync
 A native Synology DSM 7.2 package that automatically mirrors your iCloud photo library to your NAS — so your memories live on storage you own, not just on Apple's servers.
 Runs as a proper DSM app with its own tile, settings UI, scheduler daemon, and DSM notifications. No Docker, no cron hacks, no SSH fiddling.
 
 Built with the [SynoCommunity/spksrc](https://github.com/SynoCommunity/spksrc) cross-compilation framework.
 
+<img width="1851" height="1129" alt="Unbenannt-1" src="https://github.com/user-attachments/assets/d5230266-5553-4aa1-88ca-030d1ae2570d" />
+
 ## Features
 
-- **iCloud Photostream & Albums** — incremental sync with deduplication via hardlinks
+- **iCloud Photostream, Albums & Shared Libraries** — incremental sync with deduplication via hardlinks
 - **Multi-account** — several Apple IDs side by side, each with its own settings
 - **Parallel downloads** — 1/2/4/8 configurable per account
 - **Folder structure** — year / year-month / year-month-day / flat
+- **Album folders** — Apple's folder tree is kept on disk and shown as a collapsible tree; a folder's checkbox selects every album below it
 - **HEIC / JPG conversion** — keep originals, convert, or both
+- **Live Photos** — optionally save the video part as `.MOV` next to the photo (same name, as Synology Photos and Apple's export expect)
 - **Apple 2FA** via trusted-device push or SMS fallback
 - **Native DSM UI** — built with SYNO.ux components
 - **Multi-language** — English and German
-- **Unprivileged** — runs as `sc-icloudphotosync`, not root
+- **Unprivileged** — runs as `iCloudPhotoSync`, not root
+
+## Prebuild Releases
+
+You always find the latest version under releases:
+
+[https://github.com/Euphonique/iCloudPhotoSync/releases/latest](https://github.com/Euphonique/iCloudPhotoSync/releases/latest)
 
 ## Building
 
-### Prerequisites
+### Standalone build (recommended)
 
-1. Clone the [spksrc](https://github.com/SynoCommunity/spksrc) repository
-2. Set up the build environment (Docker recommended):
+No spksrc checkout required — just run the included build script:
+
+```bash
+./build.sh
+```
+
+The resulting `.spk` file is created in the project root (e.g. `iCloudPhotoSync-1.4.4.spk`).
+
+### Building with spksrc
+
+Alternatively, build via the full [spksrc](https://github.com/SynoCommunity/spksrc) cross-compilation framework:
+
+1. Clone spksrc and set up the build environment (Docker recommended):
    ```bash
    git clone https://github.com/SynoCommunity/spksrc.git
    cd spksrc
    docker build -t spksrc .
    ```
 
-### Adding this package
+2. Copy or symlink the package directory into your spksrc checkout:
+   ```bash
+   cp -r /path/to/iCloudPhotoSync-spksrc/spk/icloudphotosync spk/
+   ```
 
-Copy or symlink the package directory into your spksrc checkout:
-
-```bash
-# From the spksrc root
-cp -r /path/to/iCloudPhotoSync-spksrc/spk/icloudphotosync spk/
-```
-
-### Build
-
-```bash
-# Build for a specific architecture
-cd spk/icloudphotosync
-make arch-x64-7.2
-
-# Or build for all supported architectures
-make all-supported
-```
+3. Build:
+   ```bash
+   cd spk/icloudphotosync
+   make arch-x64-7.2
+   ```
 
 The resulting `.spk` files land in `packages/`.
 
@@ -97,11 +108,17 @@ If you have ADP enabled, this app cannot access your iCloud Photos. ADP encrypts
 1. Disable ADP: *Settings -> Apple ID -> iCloud -> Advanced Data Protection -> Turn Off*
 2. Enable temporary web access at [icloud.com](https://icloud.com) (grants ~1 hour API access)
 
+### Shared Albums (legacy)
+
+Sadly had to remove the Shared Albums feature from Settings, Albums tab, and sync engine. Legacy Shared Albums use a separate Apple API (sharedstreams.icloud.com) that is not accessible via CloudKit. Use the iCloud Shared Library (iOS 16+) feature instead.
+
 ## Privacy & security
 
-- Apple password is held in memory only during the 2FA handshake, then discarded
-- Session cookies stored under `/var/packages/icloudphotosync/var/accounts/{id}/session/`
+- Apple password is **never stored permanently** — it is only held temporarily during the 2FA handshake, encrypted with PBKDF2-derived keys and HMAC-authenticated, and kept in RAM only (`/dev/shm`). It is discarded immediately after authentication completes.
+- Session cookies stored under `/var/packages/icloudphotosync/var/accounts/{id}/session/` with restrictive file permissions (owner-only)
+- All API endpoints require a logged-in DSM user: every request is verified against DSM's `authenticate.cgi`, including the SynoToken when DSM's CSRF protection is enabled
 - No telemetry, no analytics, no phone-home
+
 
 ## License
 

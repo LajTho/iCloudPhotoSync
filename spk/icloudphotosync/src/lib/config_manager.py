@@ -39,6 +39,31 @@ def _detect_default_volume():
 DEFAULT_VOLUME = _detect_default_volume()
 
 
+def _detect_default_target_dir():
+    """Locate the iCloudPhotos share the package created on install.
+
+    DSM's data-share resource creates it on the volume the package is
+    installed on, which is not necessarily the first volume (see #78).
+    """
+    import glob
+    import re
+    for path in sorted(glob.glob("/volume[0-9]*/iCloudPhotos")):
+        if os.path.isdir(path):
+            return path
+    # Share not visible (yet) — fall back to the package's own volume
+    try:
+        real = os.path.realpath("/var/packages/iCloudPhotoSync/target")
+        m = re.match(r"^(/volume\d+)/", real)
+        if m and os.path.isdir(m.group(1)):
+            return m.group(1) + "/iCloudPhotos"
+    except OSError:
+        pass
+    return DEFAULT_VOLUME + "/iCloudPhotos"
+
+
+DEFAULT_TARGET_DIR = _detect_default_target_dir()
+
+
 PKG_VAR = os.environ.get(
     "SYNOPKG_PKGVAR",
     "/var/packages/iCloudPhotoSync/var"
@@ -184,39 +209,131 @@ def remove_account(account_id):
 
     # Clean up per-account directory
     import shutil
-    account_dir = os.path.join(ACCOUNTS_DIR, account_id)
+    account_dir = get_account_dir(account_id)
     if os.path.isdir(account_dir):
         shutil.rmtree(account_dir, ignore_errors=True)
 
 
+_ACCOUNT_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def _check_account_id(account_id):
+    """Reject account ids that could escape ACCOUNTS_DIR.
+
+    Real ids are uuid4()[:8]; anything with path separators or dots comes
+    from a crafted request and must never reach os.path.join (see #80).
+    """
+    if (not isinstance(account_id, str) or not account_id
+            or len(account_id) > 64
+            or not set(account_id) <= _ACCOUNT_ID_CHARS):
+        raise ValueError("Invalid account id")
+    return account_id
+
+
 def get_account_dir(account_id):
-    return os.path.join(ACCOUNTS_DIR, account_id)
+    return os.path.join(ACCOUNTS_DIR, _check_account_id(account_id))
 
 
 # --- Temporary password storage for pending 2FA ---
-# Stored in the per-account directory, cleared after successful auth.
+# Stored in /dev/shm (tmpfs / RAM-only) so the password never touches disk.
+# Falls back to the per-account directory when /dev/shm is unavailable.
+# Encryption: PBKDF2-derived keystream with random salt + HMAC-SHA256
+# authentication. The key is derived from machine-id + account-id + a
+# 16-byte random salt, so every encryption produces different ciphertext
+# and the file alone is useless without the machine identity.
+
+import hashlib
+import hmac
+
+_SHM_DIR = "/dev/shm"
+_MACHINE_ID_PATHS = ("/etc/machine-id", "/var/lib/dbus/machine-id", "/etc/synoinfo.conf")
+
+_PBKDF2_ITERATIONS = 100_000
+_SALT_LEN = 16
+_HMAC_LEN = 32
+
+
+def _pending_pw_path(account_id):
+    _check_account_id(account_id)
+    if os.path.isdir(_SHM_DIR):
+        return os.path.join(_SHM_DIR, "icloudphotosync_pw_%s" % account_id)
+    return os.path.join(ACCOUNTS_DIR, account_id, ".pending_pw")
+
+
+def _get_machine_id():
+    for path in _MACHINE_ID_PATHS:
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except OSError:
+            continue
+    return ""
+
+
+def _derive_keys(account_id, salt):
+    seed = ("icloudphotosync:%s:%s" % (_get_machine_id(), account_id)).encode()
+    key_block = hashlib.pbkdf2_hmac("sha256", seed, salt, _PBKDF2_ITERATIONS, dklen=64)
+    return key_block[:32], key_block[32:]
+
+
+def _keystream_encrypt(data, key):
+    out = bytearray()
+    for i in range(0, len(data), 32):
+        block_key = hashlib.sha256(key + i.to_bytes(4, "big")).digest()
+        chunk = data[i:i + 32]
+        out.extend(b ^ block_key[j] for j, b in enumerate(chunk))
+    return bytes(out)
+
 
 def save_pending_password(account_id, password):
-    """Store password temporarily while waiting for 2FA."""
-    pw_file = os.path.join(ACCOUNTS_DIR, account_id, ".pending_pw")
-    os.makedirs(os.path.join(ACCOUNTS_DIR, account_id), exist_ok=True)
-    with open(pw_file, "w") as f:
-        f.write(password)
-    os.chmod(pw_file, 0o600)
+    """Store password encrypted temporarily while waiting for 2FA."""
+    pw_file = _pending_pw_path(account_id)
+    if not pw_file.startswith(_SHM_DIR):
+        os.makedirs(os.path.join(ACCOUNTS_DIR, account_id), exist_ok=True)
+
+    salt = os.urandom(_SALT_LEN)
+    enc_key, hmac_key = _derive_keys(account_id, salt)
+    ciphertext = _keystream_encrypt(password.encode("utf-8"), enc_key)
+    mac = hmac.new(hmac_key, salt + ciphertext, "sha256").digest()
+
+    fd = os.open(pw_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(salt)
+        f.write(mac)
+        f.write(ciphertext)
 
 
 def get_pending_password(account_id):
-    """Retrieve temporarily stored password, or None."""
-    pw_file = os.path.join(ACCOUNTS_DIR, account_id, ".pending_pw")
-    if os.path.isfile(pw_file):
-        with open(pw_file, "r") as f:
-            return f.read()
-    return None
+    """Retrieve and decrypt temporarily stored password, or None."""
+    pw_file = _pending_pw_path(account_id)
+    try:
+        with open(pw_file, "rb") as f:
+            blob = f.read()
+    except FileNotFoundError:
+        return None
+
+    if len(blob) < _SALT_LEN + _HMAC_LEN + 1:
+        return None
+
+    salt = blob[:_SALT_LEN]
+    stored_mac = blob[_SALT_LEN:_SALT_LEN + _HMAC_LEN]
+    ciphertext = blob[_SALT_LEN + _HMAC_LEN:]
+
+    enc_key, hmac_key = _derive_keys(account_id, salt)
+    expected_mac = hmac.new(hmac_key, salt + ciphertext, "sha256").digest()
+    if not hmac.compare_digest(stored_mac, expected_mac):
+        return None
+
+    plaintext = _keystream_encrypt(ciphertext, enc_key)
+    try:
+        return plaintext.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def clear_pending_password(account_id):
     """Remove temporarily stored password."""
-    pw_file = os.path.join(ACCOUNTS_DIR, account_id, ".pending_pw")
+    pw_file = _pending_pw_path(account_id)
     try:
         os.remove(pw_file)
     except FileNotFoundError:
@@ -226,14 +343,14 @@ def clear_pending_password(account_id):
 # --- Per-account sync configuration ---
 
 def _sync_config_path(account_id):
-    return os.path.join(ACCOUNTS_DIR, account_id, "sync_config.json")
+    return os.path.join(get_account_dir(account_id), "sync_config.json")
 
 
 def get_sync_config(account_id):
     """Get sync configuration for an account."""
     path = _sync_config_path(account_id)
     defaults = {
-        "target_dir": DEFAULT_VOLUME + "/iCloudPhotos",
+        "target_dir": DEFAULT_TARGET_DIR,
         "photostream": {
             "enabled": True,
             "folder_structure": "year_month",  # year_month_day, year_month, year, flat
@@ -244,15 +361,16 @@ def get_sync_config(account_id):
             "selected": {},  # album_name -> True/False
             "deduplicate_hardlinks": True,  # hardlink instead of re-downloading duplicates
         },
-        "shared_albums": {
+        "shared_library": {
             "enabled": False,
-            "folder_structure": "flat",
-            "selected": {},
+            "folder_structure": "year_month",
         },
         "filenames": "original",  # original, date_based
         "conflict": "skip",  # skip, overwrite, rename
         "formats": "original",  # original, jpg_only, both
+        "jpg_quality": 85,  # 10-100, JPEG quality for HEIC conversion
         "format_folders": False,  # separate HEIC/JPG subfolders
+        "live_photos": False,  # also save Live Photo videos as <name>.MOV
         "parallel_downloads": 4,  # 1, 2, 4, 8
         "sync_interval_hours": 6,
     }
@@ -273,24 +391,54 @@ def get_sync_config(account_id):
 
 def save_sync_config(account_id, config):
     """Save sync configuration for an account."""
-    os.makedirs(os.path.join(ACCOUNTS_DIR, account_id), exist_ok=True)
+    os.makedirs(get_account_dir(account_id), exist_ok=True)
     path = _sync_config_path(account_id)
     atomic_write_json(path, config, indent=2)
 
 
-def set_album_sync(account_id, album_name, enabled):
+def set_album_sync(account_id, album_name, enabled, library=None):
     """Toggle sync for a specific album."""
     with _locked(_sync_config_path(account_id) + ".lock"):
         config = get_sync_config(account_id)
-        config["albums"]["selected"][album_name] = enabled
+        if library == "shared":
+            config.setdefault("shared_library", {}).setdefault("selected", {})[album_name] = enabled
+        else:
+            config["albums"]["selected"][album_name] = enabled
         save_sync_config(account_id, config)
     return config
 
 
-def set_shared_album_sync(account_id, album_name, enabled):
-    """Toggle sync for a shared album."""
+ALBUM_KEY_VERSION = 2
+
+
+def migrate_album_keys(account_id, legacy_keys, library=None):
+    """Rewrite album selections stored by display name to album keys (#81).
+
+    `legacy_keys` maps a display name to the key it used to resolve to, or
+    is None if the album list could not be fetched. Runs once per library:
+    afterwards a plain name is a valid key of its own (e.g. the older of
+    two same-named albums) and must not be rewritten again.
+    Returns {old_name: new_key} for every rewritten entry.
+    """
+    if legacy_keys is None:
+        return {}
     with _locked(_sync_config_path(account_id) + ".lock"):
         config = get_sync_config(account_id)
-        config.setdefault("shared_albums", {}).setdefault("selected", {})[album_name] = enabled
+        section = config.setdefault(
+            "shared_library" if library == "shared" else "albums", {})
+        if section.get("key_version", 1) >= ALBUM_KEY_VERSION:
+            return {}
+        selected = section.setdefault("selected", {})
+        moved = {}
+        for name in list(selected):
+            key = legacy_keys.get(name)
+            if not key or key == name:
+                continue
+            enabled = selected.pop(name)
+            selected.setdefault(key, enabled)
+            moved[name] = key
+        section["key_version"] = ALBUM_KEY_VERSION
         save_sync_config(account_id, config)
-    return config
+    return moved
+
+

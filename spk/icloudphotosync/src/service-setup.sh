@@ -14,6 +14,15 @@ STARTUP_ERR="${LOG_DIR}/startup-error.log"
 PYTHON_BIN="${SYNOPKG_PKGDEST}/env/bin/python3"
 
 detect_default_volume() {
+    # The iCloudPhotos share is created on the package's volume, which is
+    # not necessarily the first one (see #78).
+    for v in /volume[0-9]*; do
+        [ -d "$v/iCloudPhotos" ] && echo "$v" && return
+    done
+    if [ -n "$SYNOPKG_PKGDEST_VOL" ] && [ -d "$SYNOPKG_PKGDEST_VOL" ]; then
+        echo "$SYNOPKG_PKGDEST_VOL"
+        return
+    fi
     for v in /volume[0-9]*; do
         [ -d "$v" ] && case "$v" in *USB*|*@*) continue;; esac && echo "$v" && return
     done
@@ -172,6 +181,16 @@ service_prestart() {
 
     if ! "$PYTHON" -c "import sys; sys.exit(0)" >> "$STARTUP_ERR" 2>&1; then
         log_startup_err "Python interpreter failed sanity check: $PYTHON"
+        return 1
+    fi
+
+    if ! "$PYTHON" -c "
+import sys, os
+sys.path.insert(0, os.path.join('${SYNOPKG_PKGDEST}', 'lib'))
+sys.path.insert(0, os.path.join('${SYNOPKG_PKGDEST}', 'lib', 'vendor'))
+import config_manager, notifier, sync_engine
+" >> "$STARTUP_ERR" 2>&1; then
+        log_startup_err "Python module import check failed (see above). Python: $PYTHON"
         return 1
     fi
 

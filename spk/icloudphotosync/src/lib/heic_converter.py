@@ -38,6 +38,11 @@ def _probe_cross_compiled_heif():
     binary = os.path.join(_PKG_ROOT, "bin", "heif-convert")
     lib_dir = os.path.join(_PKG_ROOT, "lib")
     plugin_dir = os.path.join(lib_dir, "libheif", "plugins")
+    if os.path.isfile(binary) and not os.access(binary, os.X_OK):
+        try:
+            os.chmod(binary, 0o755)
+        except OSError:
+            pass
     if os.path.isfile(binary) and os.access(binary, os.X_OK):
         return {
             "cmd": "heif-convert",
@@ -58,6 +63,11 @@ def _probe_bundled_heif():
     binary = os.path.join(archdir, "heif-convert")
     lib_dir = os.path.join(archdir, "lib")
     plugin_dir = os.path.join(lib_dir, "libheif", "plugins")
+    if os.path.isfile(binary) and not os.access(binary, os.X_OK):
+        try:
+            os.chmod(binary, 0o755)
+        except OSError:
+            pass
     if os.path.isfile(binary) and os.access(binary, os.X_OK):
         return {
             "cmd": "heif-convert",
@@ -97,22 +107,31 @@ def _probe_backends():
         return b
     p = shutil.which("convert")
     if p:
+        try:
+            r = subprocess.run([p, "-list", "delegate"], capture_output=True, text=True, timeout=5)
+            if "heif" not in r.stdout.lower() and "heic" not in r.stdout.lower():
+                LOGGER.info("System convert at %s has no HEIC delegate, skipping", p)
+                return None
+        except Exception:
+            pass
         return {"cmd": "convert", "binary": p, "lib_dir": None, "plugin_dir": None, "source": "system"}
     return None
 
 
 _BACKEND = _probe_backends()
 _PILLOW_OK = False
-if not _BACKEND:
-    try:
-        from PIL import Image  # noqa: F401
-        import pillow_heif
-        pillow_heif.register_heif_opener()
-        _PILLOW_OK = True
-    except Exception:
-        _PILLOW_OK = False
+try:
+    from PIL import Image  # noqa: F401
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    _PILLOW_OK = True
+except Exception:
+    _PILLOW_OK = False
 
-if _BACKEND:
+if _BACKEND and _PILLOW_OK:
+    LOGGER.info("HEIC converter: %s (%s) at %s, Pillow fallback available",
+                _BACKEND["cmd"], _BACKEND["source"], _BACKEND["binary"])
+elif _BACKEND:
     LOGGER.info("HEIC converter: %s (%s) at %s", _BACKEND["cmd"], _BACKEND["source"], _BACKEND["binary"])
 elif _PILLOW_OK:
     LOGGER.info("HEIC converter: Pillow + pillow-heif")
@@ -143,7 +162,7 @@ def can_convert():
     return _BACKEND is not None or _PILLOW_OK
 
 
-def convert_to_jpg(heic_path, jpg_path=None, quality=92):
+def convert_to_jpg(heic_path, jpg_path=None, quality=85):
     """Convert HEIC to JPG. Returns output path on success, None on failure."""
     if not can_convert():
         return None
@@ -152,7 +171,13 @@ def convert_to_jpg(heic_path, jpg_path=None, quality=92):
         jpg_path = os.path.splitext(heic_path)[0] + ".jpg"
 
     if _BACKEND:
-        return _convert_cli(heic_path, jpg_path, quality)
+        result = _convert_cli(heic_path, jpg_path, quality)
+        if result:
+            return result
+        if _PILLOW_OK:
+            LOGGER.info("CLI backend failed, falling back to Pillow for %s", heic_path)
+            return _convert_pillow(heic_path, jpg_path, quality)
+        return None
     if _PILLOW_OK:
         return _convert_pillow(heic_path, jpg_path, quality)
     return None

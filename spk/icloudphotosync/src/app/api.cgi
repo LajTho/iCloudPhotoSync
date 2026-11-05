@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import cgi
+import urllib.parse
 
 # The app/ dir lives at /var/packages/iCloudPhotoSync/target/app/
 # The lib/ dir lives at /var/packages/iCloudPhotoSync/target/lib/
@@ -27,6 +28,7 @@ from handlers import sync as sync_handler
 from handlers import config as config_handler
 from handlers import log as log_handler
 from handlers import move as move_handler
+from handlers import update as update_handler
 
 HANDLERS = {
     "status": status_handler.handle,
@@ -37,6 +39,7 @@ HANDLERS = {
     "config": config_handler.handle,
     "log": log_handler.handle,
     "move": move_handler.handle,
+    "update": update_handler.handle,
 }
 
 
@@ -55,11 +58,26 @@ def respond(success, data=None, error=None, total=None):
     print(body)
 
 
+def _is_icloud_url(url):
+    """Validate that url points to an Apple iCloud content domain."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        # China accounts are served from icloud-content.com.cn
+        return (
+            parsed.scheme in ("http", "https")
+            and any(host == d or host.endswith("." + d)
+                    for d in ("icloud-content.com", "icloud-content.com.cn"))
+        )
+    except Exception:
+        return False
+
+
 def proxy_thumb():
     """Proxy iCloud thumbnail to avoid mixed-content browser block."""
     params = cgi.FieldStorage()
     url = params.getvalue("url", "")
-    if not url or "icloud-content.com" not in url:
+    if not url or not _is_icloud_url(url):
         print("Status: 400 Bad Request")
         print("Content-Type: text/plain")
         print()
@@ -96,7 +114,7 @@ def download_photo():
     params = cgi.FieldStorage()
     url = params.getvalue("url", "")
     filename = _safe_filename(params.getvalue("filename", ""))
-    if not url or "icloud-content.com" not in url:
+    if not url or not _is_icloud_url(url):
         print("Status: 400 Bad Request")
         print("Content-Type: text/plain")
         print()
@@ -141,7 +159,7 @@ def download_zip(raw_body):
         print("Invalid payload: %s" % e)
         return
 
-    items = [it for it in items if it.get("url") and "icloud-content.com" in it.get("url", "")]
+    items = [it for it in items if it.get("url") and _is_icloud_url(it["url"])]
     if not items:
         print("Status: 400 Bad Request")
         print("Content-Type: text/plain")
@@ -256,6 +274,178 @@ def _log_sanitizer():
     return sanitize
 
 
+def _build_diagnostics(sanitize):
+    """Build a diagnostics report with per-account state for support.
+
+    Includes sync_progress.json, manifest DB stats, sync config excerpt,
+    and file timestamps — enough to debug issues even when logs are empty.
+    """
+    import time as _time
+    import config_manager
+
+    lines = []
+    lines.append("=== iCloud Photo Sync Diagnostics ===")
+    lines.append("Generated: %s" % _time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("")
+
+    # Global config excerpt (non-sensitive)
+    try:
+        cfg = config_manager.load_config() or {}
+        lines.append("--- Global config ---")
+        lines.append("log_level: %s" % cfg.get("log_level", "INFO"))
+        lines.append("log_retention_days: %s" % cfg.get("log_retention_days", 7))
+        lines.append("accounts: %d" % len(cfg.get("accounts") or []))
+        lines.append("")
+    except Exception as e:
+        lines.append("Global config error: %s" % e)
+        lines.append("")
+
+    # Per-account diagnostics
+    accounts = config_manager.get_accounts()
+    for i, acc in enumerate(accounts, 1):
+        acc_id = acc.get("id", "")
+        lines.append("=" * 50)
+        lines.append("Account %d: %s" % (i, sanitize(acc.get("apple_id", "?"))))
+        lines.append("Status: %s" % acc.get("status", "?"))
+        acc_dir = config_manager.get_account_dir(acc_id)
+        lines.append("Account dir exists: %s" % os.path.isdir(acc_dir))
+        lines.append("")
+
+        # sync_progress.json
+        prog_path = os.path.join(acc_dir, "sync_progress.json")
+        lines.append("  --- sync_progress.json ---")
+        try:
+            stat = os.stat(prog_path)
+            lines.append("  mtime: %s" % _time.strftime(
+                "%Y-%m-%d %H:%M:%S", _time.localtime(stat.st_mtime)))
+            lines.append("  size: %d bytes" % stat.st_size)
+            import json as _json
+            with open(prog_path, "r") as f:
+                prog = _json.load(f)
+            for k in ("status", "started_at", "finished_at", "total_photos",
+                       "synced_photos", "skipped_photos", "failed_photos",
+                       "current_album", "error"):
+                v = prog.get(k, "")
+                if k in ("started_at", "finished_at") and v:
+                    v = "%s (%s)" % (v, _time.strftime(
+                        "%Y-%m-%d %H:%M:%S", _time.localtime(v)))
+                lines.append("  %s: %s" % (k, v))
+            if prog.get("warnings"):
+                lines.append("  warnings: %s" % sanitize(
+                    str(prog["warnings"][:5])))
+        except FileNotFoundError:
+            lines.append("  (file not found)")
+        except Exception as e:
+            lines.append("  error reading: %s" % e)
+        lines.append("")
+
+        # Manifest DB stats
+        lines.append("  --- Manifest DB ---")
+        db_path = os.path.join(acc_dir, "sync_manifest.db")
+        try:
+            stat = os.stat(db_path)
+            lines.append("  mtime: %s" % _time.strftime(
+                "%Y-%m-%d %H:%M:%S", _time.localtime(stat.st_mtime)))
+            lines.append("  size: %d bytes" % stat.st_size)
+            import sync_manifest
+            stats = sync_manifest.get_stats(acc_id)
+            for k, v in stats.items():
+                if k == "last_sync" and v:
+                    v = "%s (%s)" % (v, _time.strftime(
+                        "%Y-%m-%d %H:%M:%S", _time.localtime(v)))
+                lines.append("  %s: %s" % (k, v))
+        except FileNotFoundError:
+            lines.append("  (file not found)")
+        except Exception as e:
+            lines.append("  error reading: %s" % e)
+        lines.append("")
+
+        # Sync config excerpt (non-sensitive fields only)
+        lines.append("  --- Sync config ---")
+        try:
+            sc = config_manager.get_sync_config(acc_id)
+            lines.append("  target_dir: %s" % sanitize(
+                sc.get("target_dir", "")))
+            lines.append("  sync_interval: %s" % sc.get("sync_interval", ""))
+            ps = sc.get("photostream", {})
+            lines.append("  photostream.enabled: %s" % ps.get("enabled", ""))
+            lines.append("  photostream.folder_structure: %s" % ps.get(
+                "folder_structure", ""))
+            ab = sc.get("albums", {})
+            lines.append("  albums.enabled: %s" % ab.get("enabled", ""))
+            selected = ab.get("selected", {})
+            lines.append("  albums.selected: %d album(s)" % len(
+                [v for v in selected.values() if v]))
+            sl = sc.get("shared_library", {})
+            if sl:
+                lines.append("  shared_library.enabled: %s" % sl.get(
+                    "enabled", ""))
+            lines.append("  parallel_downloads: %s" % sc.get(
+                "parallel_downloads", ""))
+            lines.append("  file_format: %s" % sc.get("file_format", ""))
+            lines.append("  filename_format: %s" % sc.get(
+                "filename_format", ""))
+            lines.append("  conflict_resolution: %s" % sc.get(
+                "conflict_resolution", ""))
+        except Exception as e:
+            lines.append("  error reading: %s" % e)
+        lines.append("")
+
+        # Album cache
+        lines.append("  --- Album cache ---")
+        cache_path = os.path.join(acc_dir, "album_cache.json")
+        try:
+            stat = os.stat(cache_path)
+            lines.append("  mtime: %s" % _time.strftime(
+                "%Y-%m-%d %H:%M:%S", _time.localtime(stat.st_mtime)))
+            import json as _json
+            with open(cache_path, "r") as f:
+                cache = _json.load(f)
+            lines.append("  albums cached: %d" % len(
+                cache.get("counts", {})))
+            lines.append("  has_shared_library: %s" % cache.get(
+                "has_shared_library", False))
+            lines.append("  updated: %s" % (
+                _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(
+                    cache["updated"])) if cache.get("updated") else "never"))
+        except FileNotFoundError:
+            lines.append("  (file not found)")
+        except Exception as e:
+            lines.append("  error reading: %s" % e)
+        lines.append("")
+
+        # Scheduler marker
+        lines.append("  --- Scheduler ---")
+        marker = os.path.join(acc_dir, "last_sync_run")
+        try:
+            stat = os.stat(marker)
+            lines.append("  last_sync_run mtime: %s" % _time.strftime(
+                "%Y-%m-%d %H:%M:%S", _time.localtime(stat.st_mtime)))
+        except FileNotFoundError:
+            lines.append("  last_sync_run: (not found)")
+        except Exception as e:
+            lines.append("  error: %s" % e)
+        lines.append("")
+
+    # Log file sizes and mtimes
+    lines.append("=" * 50)
+    lines.append("--- Log files ---")
+    log_dir = os.path.join(config_manager.PKG_VAR, "logs")
+    try:
+        for name in sorted(os.listdir(log_dir)):
+            path = os.path.join(log_dir, name)
+            if os.path.isfile(path):
+                stat = os.stat(path)
+                lines.append("  %s: %d bytes, mtime %s" % (
+                    name, stat.st_size,
+                    _time.strftime("%Y-%m-%d %H:%M:%S",
+                                   _time.localtime(stat.st_mtime))))
+    except Exception as e:
+        lines.append("  error: %s" % e)
+
+    return "\n".join(lines) + "\n"
+
+
 def export_logs_zip():
     """Stream all package logs + INFO + version as a ZIP for support reports.
 
@@ -346,6 +536,15 @@ def export_logs_zip():
         except Exception:
             pass
 
+        # Per-account diagnostics: sync_progress, manifest stats, config
+        # excerpt, and file timestamps — enough to debug issues even when
+        # the logs are empty (e.g. after log rotation).
+        try:
+            diag = _build_diagnostics(sanitize)
+            zf.writestr("diagnostics.txt", diag)
+        except Exception:
+            pass
+
         # Also include a one-line note that the archive was sanitized so
         # anyone receiving it knows Apple IDs are aliases, not the originals.
         zf.writestr(
@@ -370,16 +569,75 @@ def export_logs_zip():
     sys.stdout.buffer.write(data)
 
 
-def _method_from_query():
-    """Parse the 'method' value from QUERY_STRING without touching stdin."""
-    import urllib.parse
+def _query_param(name):
+    """Parse one value from QUERY_STRING without touching stdin."""
     qs = os.environ.get("QUERY_STRING", "")
     parsed = urllib.parse.parse_qs(qs)
-    vals = parsed.get("method", [])
+    vals = parsed.get(name, [])
     return vals[0] if vals else ""
 
 
+def _method_from_query():
+    """Parse the 'method' value from QUERY_STRING without touching stdin."""
+    return _query_param("method")
+
+
+AUTHENTICATE_CGI = "/usr/syno/synoman/webman/modules/authenticate.cgi"
+
+
+def _dsm_user():
+    """Return the DSM user who sent this request, or "" if not logged in.
+
+    DSM does not authenticate CGIs under /webman/3rdparty/ by itself (#77).
+    Synology's developer guide says to ask authenticate.cgi, which checks
+    the session cookie and — with CSRF protection enabled — the SynoToken.
+    It reads the token from QUERY_STRING, so the token the frontend sends
+    (X-SYNO-TOKEN header for Ajax, SynoToken param for <img>/downloads)
+    is passed on that way. It must never see our POST body.
+    """
+    import subprocess
+    # DSM's own Ajax hook sends the token URI-encoded; parse_qs already
+    # decodes the query parameter
+    token = urllib.parse.unquote(os.environ.get("HTTP_X_SYNO_TOKEN", "")) or \
+        _query_param("SynoToken")
+    env = dict(os.environ)
+    env["QUERY_STRING"] = ("SynoToken=" + urllib.parse.quote(token)) if token else ""
+    env["REQUEST_METHOD"] = "GET"
+    env.pop("CONTENT_LENGTH", None)
+    env.pop("CONTENT_TYPE", None)
+    try:
+        result = subprocess.run(
+            [AUTHENTICATE_CGI], env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = [ln.strip() for ln in result.stdout.decode("utf-8", "replace").splitlines()]
+    lines = [ln for ln in lines if ln]
+    return lines[-1] if lines else ""
+
+
+def _deny():
+    body = json.dumps({"success": False, "error": {
+        "code": 401, "message": "Not logged in to DSM — please reload the page."}})
+    print("Status: 401 Unauthorized")
+    print("Content-Type: application/json")
+    print("Content-Length: %d" % len(body))
+    print()
+    print(body)
+
+
 def main():
+    # Every endpoint touches Apple credentials, the user's photos or the
+    # filesystem — none may be reachable without a DSM login (#77).
+    user = _dsm_user()
+    if not user:
+        _deny()
+        return
+    # Lets handlers resolve /home/... paths for the requesting user
+    os.environ["ICS_DSM_USER"] = user
+
     # Read the method from QUERY_STRING first so POST bodies (download_zip)
     # aren't accidentally consumed by cgi.FieldStorage before the handler runs.
     method = _method_from_query()
@@ -415,6 +673,10 @@ def main():
         result = handler(params)
         respond(**result)
     except Exception as e:
+        # The album handler wires the root logger to album.log on import;
+        # without this the error only reached the browser (#68).
+        import logging
+        logging.getLogger("api").exception("Unhandled error in method %r", method)
         respond(False, error={"code": 500, "message": str(e)})
 
 

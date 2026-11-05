@@ -1,7 +1,7 @@
 """
 pyicloud_ipd base — simplified from icloudpd v1.32.2.
 
-Stripped: foundation dependency, observer pattern, CN domain support.
+Stripped: foundation dependency, observer pattern.
 Kept: SRP authentication, 2FA, session persistence, Photos service.
 """
 import base64
@@ -106,6 +106,20 @@ class PyiCloudService:
         else:
             self.session_data["client_id"] = self.client_id
 
+        # Restore domain from session if it was previously detected
+        saved_domain = self.session_data.get("domain")
+        if saved_domain and saved_domain != self.domain:
+            LOGGER.debug("Restoring saved domain '%s' from session", saved_domain)
+            if saved_domain == "cn":
+                self.AUTH_ENDPOINT = "https://idmsa.apple.com.cn/appleauth/auth"
+                self.HOME_ENDPOINT = "https://www.icloud.com.cn"
+                self.SETUP_ENDPOINT = "https://setup.icloud.com.cn/setup/ws/1"
+            elif saved_domain == "com":
+                self.AUTH_ENDPOINT = AUTH_ENDPOINT
+                self.HOME_ENDPOINT = HOME_ENDPOINT
+                self.SETUP_ENDPOINT = SETUP_ENDPOINT
+            self.domain = saved_domain
+
         # HTTP session
         self.session = PyiCloudSession(self)
         self.session.verify = verify
@@ -152,9 +166,25 @@ class PyiCloudService:
             except PyiCloudAPIResponseException:
                 LOGGER.debug("Invalid authentication token, will log in from scratch.")
 
+        if not login_successful and not force_refresh and \
+                self.session_data.get("session_token"):
+            # /validate relies on the short-lived WEBAUTH cookies. When they
+            # have expired (or a fresh process can't use them) the stored
+            # session token is usually still valid (~60 days) — accountLogin
+            # mints fresh cookies from it. Without this fallback every cookie
+            # hiccup forced a full re-login (see #62).
+            LOGGER.debug("Token validation failed — retrying accountLogin "
+                         "with stored session token")
+            try:
+                self._authenticate_with_token()
+                login_successful = True
+            except PyiCloudFailedLoginException:
+                LOGGER.debug("accountLogin with stored session token failed")
+
         if not login_successful:
             if not self._password:
-                LOGGER.debug("No password provided")
+                LOGGER.info("No password provided and no valid session token — "
+                            "re-authentication required for %s", self.apple_id)
                 return
 
             self.password_filter = PyiCloudPasswordFilter(self._password)
@@ -164,7 +194,15 @@ class PyiCloudService:
             self._authenticate_srp(self._password)
             self._authenticate_with_token()
 
-        self.params.update({"dsid": self.data["dsInfo"]["dsid"]})
+        ds_info = self.data.get("dsInfo")
+        if not ds_info:
+            raise PyiCloudFailedLoginException(
+                "Authentication failed: Apple did not return account info. "
+                "This may indicate a regional endpoint mismatch — try logging "
+                "in again or check your Apple ID region settings."
+            )
+        self.params.update({"dsid": ds_info["dsid"]})
+        self.session_data["domain"] = self.domain
         self._webservices = self.data.get("webservices", {})
         LOGGER.info("Authentication completed successfully")
 
@@ -187,11 +225,74 @@ class PyiCloudService:
                 "Invalid authentication token.", error
             ) from error
 
-        domain_to_use = self.data.get("domainToUse")
-        if domain_to_use is not None:
+        domain_to_use = self._normalize_domain(self.data.get("domainToUse"))
+        if domain_to_use is not None and domain_to_use != self.domain:
+            LOGGER.info("Apple requires domain '%s', switching from '%s'",
+                        domain_to_use, self.domain)
+            self._switch_domain(domain_to_use)
+
+    def refresh_web_session(self):
+        """Mint fresh WEBAUTH cookies from the stored session token.
+
+        Called when CloudKit rejects a request with 401 although the
+        session itself validated (see PyiCloudSession.request).
+        """
+        self._authenticate_with_token()
+        if not self.data.get("dsInfo"):
+            raise PyiCloudFailedLoginException(
+                "accountLogin returned no account info")
+        self._webservices = self.data.get("webservices", {})
+
+    @staticmethod
+    def _normalize_domain(domain_value):
+        """Normalize Apple's domainToUse response to 'com' or 'cn'."""
+        if domain_value is None:
+            return None
+        d = domain_value.lower()
+        if ".cn" in d:
+            return "cn"
+        if "icloud.com" in d or d == "com":
+            return "com"
+        return domain_value
+
+    def _switch_domain(self, new_domain):
+        """Switch to a different iCloud domain and re-authenticate.
+
+        Auth tokens are realm-specific: a session token minted by
+        idmsa.apple.com is not accepted by setup.icloud.com.cn (and vice
+        versa) — accountLogin there returns no dsInfo (see #59). When we
+        still have the password (i.e. during an interactive login), redo
+        the full SRP handshake against the new realm's IDMSA before
+        calling accountLogin.
+        """
+        if getattr(self, '_domain_switched', False):
             raise PyiCloudConnectionException(
-                "Apple insists on using %s. Please use --domain parameter" % domain_to_use
-            )
+                "Domain redirect loop: Apple keeps switching domains")
+        self._domain_switched = True
+        if new_domain == "cn":
+            self.AUTH_ENDPOINT = "https://idmsa.apple.com.cn/appleauth/auth"
+            self.HOME_ENDPOINT = "https://www.icloud.com.cn"
+            self.SETUP_ENDPOINT = "https://setup.icloud.com.cn/setup/ws/1"
+        elif new_domain == "com":
+            self.AUTH_ENDPOINT = AUTH_ENDPOINT
+            self.HOME_ENDPOINT = HOME_ENDPOINT
+            self.SETUP_ENDPOINT = SETUP_ENDPOINT
+        else:
+            raise PyiCloudConnectionException(
+                "Apple requires unsupported domain '%s'" % new_domain)
+        self.domain = new_domain
+        self.session_data["domain"] = new_domain
+        self.session.headers.update({
+            "Origin": self.HOME_ENDPOINT,
+            "Referer": "%s/" % self.HOME_ENDPOINT,
+        })
+        if self._password:
+            # Tokens and SRP session state from the old realm are invalid
+            # on the new one — drop them and authenticate from scratch.
+            for key in ("scnt", "session_id", "session_token"):
+                self.session_data.pop(key, None)
+            self._authenticate_srp(self._password)
+        self._authenticate_with_token()
 
     def _authenticate_srp(self, password):
         """SRP (Secure Remote Password) authentication with Apple."""
@@ -230,9 +331,12 @@ class PyiCloudService:
             "accountName": uname,
             "protocols": ["s2k", "s2k_fo"],
         }
+        # Origin/Referer must match the realm we authenticate against —
+        # idmsa.apple.com.cn for China accounts, idmsa.apple.com otherwise.
+        idmsa_origin = self.AUTH_ENDPOINT.split("/appleauth")[0]
         headers = self._get_auth_headers({
-            "Origin": "https://idmsa.apple.com",
-            "Referer": "https://idmsa.apple.com/",
+            "Origin": idmsa_origin,
+            "Referer": idmsa_origin + "/",
         })
 
         try:
@@ -311,10 +415,18 @@ class PyiCloudService:
                 data="null",
                 headers=headers,
             )
-            return response.json()
+            data = response.json()
         except PyiCloudAPIResponseException as err:
             LOGGER.debug("Invalid authentication token")
             raise err
+
+        domain_to_use = self._normalize_domain(data.get("domainToUse"))
+        if domain_to_use is not None and domain_to_use != self.domain:
+            LOGGER.info("Token validation: Apple requires domain '%s', switching from '%s'",
+                        domain_to_use, self.domain)
+            self._switch_domain(domain_to_use)
+            data = self.data
+        return data
 
     def _get_auth_headers(self, overrides=None):
         """Build headers for Apple auth endpoints."""

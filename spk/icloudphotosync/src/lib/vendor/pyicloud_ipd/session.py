@@ -12,6 +12,7 @@ from pyicloud_ipd.exceptions import (
     PyiCloudAPIResponseException,
     PyiCloudServiceNotActivatedException,
     PyiCloudServiceUnavailableException,
+    PyiCloudSessionExpiredException,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class PyiCloudSession(Session):
         self.service = service
         super().__init__()
 
-    def request(self, method, url, **kwargs):
+    def request(self, method, url, _auth_retry=True, **kwargs):
         # Charge logging to the right service endpoint
         try:
             callee = inspect.stack()[2]
@@ -83,32 +84,55 @@ class PyiCloudSession(Session):
             if response.headers.get(header):
                 self.service.session_data[value] = response.headers.get(header)
 
-        # Save session_data to file. Atomic write because multiple CGI
-        # handlers may invoke API calls concurrently for the same account
-        # — a half-written session file means the next request loses the
-        # trust token and the user gets bounced to re-auth.
         try:
-            tmp = self.service.session_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(self.service.session_path),
+                        mode=0o700, exist_ok=True)
+            with open(self.service.session_path, "w", encoding="utf-8") as f:
                 json.dump(self.service.session_data, f)
                 f.flush()
                 try:
                     os.fsync(f.fileno())
                 except OSError:
                     pass
-            os.replace(tmp, self.service.session_path)
+            try:
+                os.chmod(self.service.session_path, 0o600)
+            except OSError:
+                pass
         except Exception:
-            pass
+            LOGGER.warning("Failed to save session data to %s",
+                           self.service.session_path, exc_info=True)
 
         # Save cookies
         try:
             self.cookies.save(ignore_discard=True, ignore_expires=True)
+            try:
+                os.chmod(self.cookies.filename, 0o600)
+            except OSError:
+                pass
         except Exception:
-            pass
+            LOGGER.warning("Failed to save cookies to %s",
+                           self.cookies.filename, exc_info=True)
+
+        # CloudKit answers 401 AUTHENTICATION_FAILED ("no auth method found")
+        # once the short-lived WEBAUTH cookies have expired, even though
+        # /validate still accepts the session. accountLogin with the stored
+        # session token mints fresh cookies — retry the request once.
+        if (response.status_code == 401 and _auth_retry
+                and "ckdatabasews" in url
+                and self.service.session_data.get("session_token")):
+            LOGGER.info("CloudKit rejected the web session (401) — "
+                        "refreshing cookies via accountLogin and retrying")
+            try:
+                self.service.refresh_web_session()
+            except Exception:
+                LOGGER.warning("Web session refresh failed", exc_info=True)
+            else:
+                return self.request(method, url, _auth_retry=False, **kwargs)
 
         if not response.ok and (
             content_type not in json_mimetypes or response.status_code in [421, 450, 500]
         ):
+            self._log_error_response(request_logger, response)
             self._raise_error(str(response.status_code), response.reason)
 
         if content_type not in json_mimetypes:
@@ -130,6 +154,7 @@ class PyiCloudSession(Session):
                 if errors:
                     code = errors[0].get("code")
                     reason = errors[0].get("message")
+                self._log_error_response(request_logger, response, code, reason)
                 self._raise_error(code or "Unknown", reason or "Unknown")
             elif not data.get("success"):
                 reason = data.get("errorMessage")
@@ -147,9 +172,25 @@ class PyiCloudSession(Session):
                     code = data.get("error")
 
                 if reason:
+                    self._log_error_response(request_logger, response, code, reason)
                     self._raise_error(code or "Unknown", reason)
 
         return response
+
+    @staticmethod
+    def _log_error_response(logger, response, code=None, reason=None):
+        body = ""
+        try:
+            body = response.text[:1000]
+        except Exception:
+            pass
+        logger.warning(
+            "Apple API error: %s %s → HTTP %d | code=%s reason=%s | body=%s",
+            response.request.method, response.url,
+            response.status_code,
+            code or "-", reason or "-",
+            body or "(empty)"
+        )
 
     def _raise_error(self, code, reason):
         if (
@@ -157,7 +198,14 @@ class PyiCloudSession(Session):
             and reason == "Missing X-APPLE-WEBAUTH-TOKEN cookie"
         ):
             raise PyiCloud2SARequiredException(self.service.apple_id)
-        if code in ("ZONE_NOT_FOUND", "AUTHENTICATION_FAILED"):
+        if code == "AUTHENTICATION_FAILED":
+            raise PyiCloudSessionExpiredException(
+                "Apple rejected the iCloud session (%s). Please sign in "
+                "again in iCloud Photo Sync. If this keeps happening, sign "
+                "in once at icloud.com/photos in a browser and check that "
+                "'Access iCloud Data on the Web' is enabled for this Apple "
+                "ID." % (reason or "no auth method found"), code)
+        if code == "ZONE_NOT_FOUND":
             reason = (
                 "Please log into https://icloud.com/ to manually "
                 "finish setting up your iCloud service"
@@ -177,5 +225,11 @@ class PyiCloudSession(Session):
             )
         if code in ["421", "450", "500"]:
             reason = "Authentication required for Account."
+        if code == "Unknown" and reason in ("Unknown", "Unknown reason"):
+            reason = (
+                "Apple returned an unrecognized error. This is usually "
+                "temporary — try logging out and back in. If it persists, "
+                "check the package log for details."
+            )
 
         raise PyiCloudAPIResponseException(reason, code)
